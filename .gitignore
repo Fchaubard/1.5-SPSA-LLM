@@ -42,9 +42,11 @@ garbage/
 logs/
 logs_backup*/
 checkpoints/
+wandb/
 data_cache/
 *.log
 *.pt
+*.pth
 *.bin
 *.safetensors
 
