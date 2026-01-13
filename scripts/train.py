@@ -51,13 +51,15 @@ def _unpack_and_accumulate(grad_ptr, packed_ptr, n_elements, coeff, BLOCK_SIZE: 
 
 class SPSATrainer:
     def __init__(self, model, lr=1e-4, epsilon=1e-4, n_perts=40,
-                 use_curvature=False, saturating_alpha=0.1, lambda_reg=1.0):
+                 use_curvature=False, saturating_alpha=0.1, lambda_reg=1.0,
+                 memory_efficient=False):
         self.lr = lr
         self.epsilon = epsilon
         self.n_perts = n_perts
         self.use_curvature = use_curvature
         self.saturating_alpha = saturating_alpha
         self.lambda_reg = lambda_reg
+        self.memory_efficient = memory_efficient
 
         self.params = [p for p in model.parameters() if p.requires_grad]
         self.total = sum(p.numel() for p in self.params)
@@ -77,11 +79,15 @@ class SPSATrainer:
             })
             offset += numel
 
-        # Gradient accumulator per param (bf16)
-        self.grads = [torch.zeros(info['numel'], device='cuda', dtype=torch.bfloat16)
-                      for info in self.param_info]
+        # Gradient accumulator per param (bf16) - skip if memory_efficient
+        if not memory_efficient:
+            self.grads = [torch.zeros(info['numel'], device='cuda', dtype=torch.bfloat16)
+                          for info in self.param_info]
+        else:
+            self.grads = None
 
-        log(f"SPSATrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB")
+        mode_str = " [MEMORY EFFICIENT]" if memory_efficient else ""
+        log(f"SPSATrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB{mode_str}")
 
     def probe_loss_at_lr(self, loss_fn, test_lr, seed=0, accum_batches=1):
         """
@@ -90,6 +96,9 @@ class SPSATrainer:
 
         accum_batches: Number of batches to accumulate for more stable loss estimate.
         """
+        if self.memory_efficient:
+            return self._probe_loss_at_lr_memory_efficient(loss_fn, test_lr, seed, accum_batches)
+
         test_eps = test_lr  # Tied
 
         # Zero out gradient accumulators
@@ -167,6 +176,83 @@ class SPSATrainer:
         # Restore weights by adding back what we subtracted
         for info, grad in zip(self.param_info, self.grads):
             info['param'].data.view(-1).add_(grad, alpha=test_lr)
+
+        return loss_after
+
+    def _probe_loss_at_lr_memory_efficient(self, loss_fn, test_lr, seed=0, accum_batches=1):
+        """Memory-efficient version of probe_loss_at_lr. Regenerates directions via RNG."""
+        test_eps = test_lr
+        grad_coeffs = []
+
+        if self.use_curvature:
+            loss_clean = loss_fn()
+
+        for pert_idx in range(self.n_perts):
+            torch.manual_seed(seed * 10000 + pert_idx)
+            packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], test_eps, BLOCK_SIZE=1024)
+
+            loss_plus = 0.0
+            for _ in range(accum_batches):
+                loss_plus += loss_fn()
+            loss_plus /= accum_batches
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], -2*test_eps, BLOCK_SIZE=1024)
+
+            loss_minus = 0.0
+            for _ in range(accum_batches):
+                loss_minus += loss_fn()
+            loss_minus /= accum_batches
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], test_eps, BLOCK_SIZE=1024)
+
+            if self.use_curvature:
+                curv = abs(loss_plus - 2*loss_clean + loss_minus) / (test_eps ** 2)
+                curvature = max(curv ** self.saturating_alpha, self.lambda_reg)
+                grad_coeff = (loss_plus - loss_minus) / (2 * test_eps * self.n_perts * curvature)
+            else:
+                grad_coeff = (loss_plus - loss_minus) / (2 * test_eps * self.n_perts)
+
+            grad_coeffs.append(grad_coeff)
+            del packed
+
+        for pert_idx, grad_coeff in enumerate(grad_coeffs):
+            torch.manual_seed(seed * 10000 + pert_idx)
+            packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], -test_lr * grad_coeff, BLOCK_SIZE=1024)
+            del packed
+
+        loss_after = 0.0
+        for _ in range(accum_batches):
+            loss_after += loss_fn()
+        loss_after /= accum_batches
+
+        for pert_idx, grad_coeff in enumerate(grad_coeffs):
+            torch.manual_seed(seed * 10000 + pert_idx)
+            packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], test_lr * grad_coeff, BLOCK_SIZE=1024)
+            del packed
 
         return loss_after
 
@@ -339,6 +425,9 @@ class SPSATrainer:
         return best_lr
 
     def step(self, loss_fn, iteration):
+        if self.memory_efficient:
+            return self._step_memory_efficient(loss_fn, iteration)
+
         for g in self.grads:
             g.zero_()
 
@@ -400,6 +489,65 @@ class SPSATrainer:
         # Apply update
         for info, grad in zip(self.param_info, self.grads):
             info['param'].data.view(-1).sub_(grad, alpha=self.lr)
+
+        return total_loss / self.n_perts
+
+    def _step_memory_efficient(self, loss_fn, iteration):
+        """Memory-efficient step. Regenerates directions via RNG instead of caching grads."""
+        total_loss = 0.0
+        grad_coeffs = []
+
+        if self.use_curvature:
+            loss_clean = loss_fn()
+
+        for pert_idx in range(self.n_perts):
+            torch.manual_seed(iteration * 10000 + pert_idx)
+            packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], self.epsilon, BLOCK_SIZE=1024)
+
+            loss_plus = loss_fn()
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
+
+            loss_minus = loss_fn()
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], self.epsilon, BLOCK_SIZE=1024)
+
+            if self.use_curvature:
+                curv = abs(loss_plus - 2*loss_clean + loss_minus) / (self.epsilon ** 2)
+                curvature = max(curv ** self.saturating_alpha, self.lambda_reg)
+                grad_coeff = (loss_plus - loss_minus) / (2 * self.epsilon * self.n_perts * curvature)
+            else:
+                grad_coeff = (loss_plus - loss_minus) / (2 * self.epsilon * self.n_perts)
+
+            grad_coeffs.append(grad_coeff)
+            total_loss += (loss_plus + loss_minus) / 2
+            del packed
+
+        for pert_idx, grad_coeff in enumerate(grad_coeffs):
+            torch.manual_seed(iteration * 10000 + pert_idx)
+            packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+
+            for info in self.param_info:
+                flat = info['param'].data.view(-1)
+                _unpack_and_apply[info['grid']](
+                    flat, packed[info['packed_offset']:],
+                    info['numel'], -self.lr * grad_coeff, BLOCK_SIZE=1024)
+
+            del packed
 
         return total_loss / self.n_perts
 
@@ -867,6 +1015,7 @@ def main():
     parser.add_argument('--use_1_5_spsa', action='store_true', help='Use 1.5-SPSA with curvature scaling')
     parser.add_argument('--saturating_alpha', type=float, default=0.1, help='Exponent for saturating curvature')
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Minimum curvature regularization')
+    parser.add_argument('--memory_efficient', action='store_true', help='Memory efficient mode: regenerate directions via RNG instead of caching gradients')
 
     # Adaptive search options
     parser.add_argument('--search_strategy', type=str, default='none',
@@ -1311,7 +1460,8 @@ def main():
         trainer = SPSATrainer(model, lr=lr, epsilon=epsilon, n_perts=n_perts,
                               use_curvature=args.use_1_5_spsa,
                               saturating_alpha=args.saturating_alpha,
-                              lambda_reg=args.lambda_reg)
+                              lambda_reg=args.lambda_reg,
+                              memory_efficient=args.memory_efficient)
 
     # Parse explicit LR points if provided
     explicit_lrs = None

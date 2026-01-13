@@ -28,6 +28,7 @@ CHECKPOINT_INTERVAL=1000      # Save checkpoint every N iterations (set high to 
 SEARCH_STRATEGY="none"        # LR search: "none", "line", "local", "binary", "quadratic"
 LEARNING_RATE=1e-4            # Initial learning rate
 EPSILON=1e-4                  # Perturbation size (defaults to LR if not set)
+MEMORY_EFFICIENT=true         # Regenerate RNG instead of caching gradients (required for 13B+ on 40GB)
 
 # Per-task sequence lengths (based on MeZO paper / typical input lengths)
 # MeZO uses max_length=2048 but most tasks don't need that much
@@ -51,7 +52,11 @@ WANDB_API_KEY=""
 # DO NOT EDIT BELOW THIS LINE (unless you know what you're doing)
 # ==============================================================================
 
-cd /workspace/1.5-SPSA-LLM
+# Get repo root (parent of scripts directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+cd "$REPO_ROOT"
 mkdir -p logs checkpoints
 
 # Map model name to HuggingFace model path
@@ -100,6 +105,12 @@ if [ "$WANDB_ENABLED" = true ]; then
     WANDB_ARGS="--wandb --wandb_project $WANDB_PROJECT"
 fi
 
+# Build memory efficient argument
+MEM_EFF_ARG=""
+if [ "$MEMORY_EFFICIENT" = true ]; then
+    MEM_EFF_ARG="--memory_efficient"
+fi
+
 # Export W&B API key if set
 if [ -n "$WANDB_API_KEY" ]; then
     export WANDB_API_KEY="$WANDB_API_KEY"
@@ -131,6 +142,7 @@ echo "  Eval Int.:    $EVAL_INTERVAL"
 echo "  Ckpt Int.:    $CHECKPOINT_INTERVAL"
 echo "  Search:       $SEARCH_STRATEGY"
 echo "  LR:           $LEARNING_RATE"
+echo "  Mem Eff:      $MEMORY_EFFICIENT"
 echo "  W&B:          $WANDB_ENABLED"
 echo ""
 echo "Per-task sequence lengths:"
@@ -152,11 +164,11 @@ for GPU_ID in {0..5}; do
     echo "Launching $TASK on GPU $GPU_ID (screen: $SESSION_NAME, seq_len: $TASK_SEQ_LEN)"
 
     screen -dmS "$SESSION_NAME" bash -c "
-        cd /workspace/1.5-SPSA-LLM
+        cd $REPO_ROOT
 
         # Export W&B API key and Python path in screen session
         export WANDB_API_KEY='$WANDB_API_KEY'
-        export PYTHONPATH=/workspace/1.5-SPSA-LLM
+        export PYTHONPATH=$REPO_ROOT
 
         echo '=============================================='
         echo 'Starting $TASK training on GPU $GPU_ID'
@@ -178,6 +190,7 @@ for GPU_ID in {0..5}; do
             --eval_interval $EVAL_INTERVAL \\
             --checkpoint_interval $CHECKPOINT_INTERVAL \\
             --search_strategy $SEARCH_STRATEGY \\
+            $MEM_EFF_ARG \\
             $WANDB_ARGS \\
             --wandb_run_name '${SOLVER}_${TASK}_${MODEL}' \\
             2>&1 | tee logs/benchmark_${SOLVER}_${TASK}_${MODEL}.log
