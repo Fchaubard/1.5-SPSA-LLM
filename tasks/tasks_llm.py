@@ -150,9 +150,28 @@ class LLMTaskDataset:
         val_data = dataset.get("validation", None)
         test_data = dataset.get("test", None)
 
-        # If no test split, use validation for test
+        # Check if test labels are hidden (-1) - common in GLUE for leaderboard
+        use_val_as_test = False
         if test_data is None or len(test_data) == 0:
-            test_data = val_data
+            use_val_as_test = True
+            print(f"[{self.task_name}] No test split available")
+        elif test_data and len(test_data) > 0:
+            label_col = self.config["label_column"]
+            sample_labels = [test_data[i][label_col] for i in range(min(10, len(test_data)))]
+            if all(l == -1 for l in sample_labels):
+                use_val_as_test = True
+                print(f"[{self.task_name}] Test labels hidden (-1)")
+
+        # If test is unusable, split validation into val (first half) and test (second half)
+        if use_val_as_test and val_data:
+            val_list = list(val_data)
+            random.seed(self.seed)
+            random.shuffle(val_list)
+            mid = len(val_list) // 2
+            # Use first half for val, second half for test
+            test_data = val_list[mid:]
+            val_data = val_list[:mid]
+            print(f"[{self.task_name}] Split validation into val={len(val_data)}, test={len(test_data)}")
 
         # Shuffle with seed
         random.seed(self.seed)

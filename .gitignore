@@ -1,11 +1,6 @@
-# Environment and secrets
-.env
-.env.*
-.secrets
-.bashrc
-.bash_history
-.python_history
-.claude/
+# Environment and secrets - ignore all dotfiles/dotfolders
+.*
+!.gitignore
 
 # Python
 __pycache__/
@@ -33,11 +28,8 @@ wheels/
 venv/
 ENV/
 env/
-.venv/
 
 # IDE
-.idea/
-.vscode/
 *.swp
 *.swo
 *~
@@ -48,6 +40,7 @@ env/
 # Project specific
 garbage/
 logs/
+logs_backup*/
 checkpoints/
 data_cache/
 *.log
@@ -58,3 +51,6 @@ data_cache/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude
+CLAUDE_RULES.md

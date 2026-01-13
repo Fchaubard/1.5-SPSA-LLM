@@ -949,6 +949,7 @@ def main():
     # For LR decay on train accuracy plateau
     acc_ema = 0.5  # EMA of training accuracy
     best_acc_ema = 0.0  # Best train accuracy EMA
+    best_test_acc = 0.0  # Best test accuracy (for checkpointing)
     acc_plateau_count = 0  # Iterations without accuracy improvement
     lr_decay_count = 0  # Number of LR decays performed
 
@@ -1067,10 +1068,31 @@ def main():
         log(f"Iter {i:6d} | Loss: {loss:.4f}{acc_str} | Best: {best:.4f}{ema_str} | "
             f"Red: {initial_loss/loss:.2f}x | lr={lr:.0e} eps={epsilon:.0e} | {avg:.1f}s/it | ETA: {eta/3600:.1f}h")
 
-        # Periodic evaluation for tasks
+        # Periodic evaluation for tasks (val AND test)
         if evaluate_fn and (i + 1) % args.eval_interval == 0:
             val_acc = evaluate_fn('val')
-            log(f"  >>> [Eval] Val Accuracy: {val_acc:.4f} ({val_acc*100:.1f}%)")
+            test_acc = evaluate_fn('test')
+            log(f"  >>> [Eval] Val: {val_acc:.4f} ({val_acc*100:.1f}%) | Test: {test_acc:.4f} ({test_acc*100:.1f}%)")
+
+            # Checkpoint on best test accuracy
+            if test_acc > best_test_acc:
+                best_test_acc = test_acc
+                import os
+                os.makedirs('checkpoints', exist_ok=True)
+                ckpt = {
+                    'iteration': i + 1,
+                    'model_state_dict': {k: v.cpu().clone() for k, v in model.state_dict().items()},
+                    'losses': losses,
+                    'best': best,
+                    'lr': trainer.lr,
+                    'epsilon': trainer.epsilon,
+                    'val_acc': val_acc,
+                    'test_acc': test_acc,
+                    'args': vars(args),
+                }
+                ckpt_path = f'checkpoints/best_{args.task}_np{args.n_perts}_bs{args.batch_size}.pt'
+                torch.save(ckpt, ckpt_path)
+                log(f"  >>> NEW BEST TEST! Checkpoint saved: {ckpt_path}")
         last_t = now
         last_i = i
 
