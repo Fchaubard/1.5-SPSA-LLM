@@ -617,15 +617,245 @@ class RandomSearchTrainer:
         return best_eps, improved
 
 
+class MeZOTrainer:
+    """
+    MeZO (Memory-Efficient ZerO-order) Optimizer.
+
+    This implements the MeZO baseline from the paper:
+    "Fine-Tuning Language Models with Just Forward Passes"
+
+    MeZO is essentially 1-SPSA with:
+    - Single perturbation per step (n_perts=1)
+    - In-place perturbation to save memory
+    - Same random seed used for +/- perturbations
+    """
+    def __init__(self, model, lr=1e-5, epsilon=1e-3):
+        self.lr = lr
+        self.epsilon = epsilon
+
+        self.params = [p for p in model.parameters() if p.requires_grad]
+        self.total = sum(p.numel() for p in self.params)
+        self.packed_size = (self.total + 7) // 8
+
+        # Compute offsets
+        self.param_info = []
+        offset = 0
+        for p in self.params:
+            numel = p.numel()
+            self.param_info.append({
+                'param': p,
+                'offset': offset,
+                'packed_offset': offset // 8,
+                'numel': numel,
+                'grid': ((numel + 1023) // 1024,),
+            })
+            offset += numel
+
+        log(f"MeZOTrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB")
+
+    def step(self, loss_fn, iteration):
+        """
+        Perform one MeZO step with a single perturbation.
+        """
+        # Generate random perturbation
+        torch.manual_seed(iteration)
+        packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+
+        # Apply +epsilon
+        for info in self.param_info:
+            flat = info['param'].data.view(-1)
+            _unpack_and_apply[info['grid']](
+                flat, packed[info['packed_offset']:],
+                info['numel'], self.epsilon, BLOCK_SIZE=1024)
+
+        loss_plus = loss_fn()
+
+        # Apply -2*epsilon (to get to -epsilon from +epsilon)
+        for info in self.param_info:
+            flat = info['param'].data.view(-1)
+            _unpack_and_apply[info['grid']](
+                flat, packed[info['packed_offset']:],
+                info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
+
+        loss_minus = loss_fn()
+
+        # Compute projected gradient and apply update
+        # Instead of restoring and then updating, we directly compute the final position
+        # Current position: theta - epsilon*z
+        # Want: theta - lr * g * z where g = (loss_plus - loss_minus) / (2*epsilon)
+        # So we need to apply: +epsilon*z - lr*g*z = (epsilon - lr*g)*z
+        grad = (loss_plus - loss_minus) / (2 * self.epsilon)
+        update_scale = self.epsilon - self.lr * grad
+
+        for info in self.param_info:
+            flat = info['param'].data.view(-1)
+            _unpack_and_apply[info['grid']](
+                flat, packed[info['packed_offset']:],
+                info['numel'], update_scale, BLOCK_SIZE=1024)
+
+        del packed
+        return (loss_plus + loss_minus) / 2
+
+    def line_search_lr(self, loss_fn, lr_min, lr_max, n_points=20, seed=0, n_seeds=10, resample_batch_fn=None, explicit_lrs=None):
+        """Line search for optimal lr."""
+        import numpy as np
+
+        if explicit_lrs is not None:
+            lrs = explicit_lrs
+        else:
+            log_min = math.log10(lr_min)
+            log_max = math.log10(lr_max)
+            log_lrs = np.linspace(log_min, log_max, n_points)
+            lrs = [10 ** log_lr for log_lr in log_lrs]
+
+        log(f"  Line search: testing {len(lrs)} points (n_seeds={n_seeds})")
+
+        results = []
+        for i, lr in enumerate(lrs):
+            total_loss = 0.0
+            for s in range(n_seeds):
+                probe_seed = seed + i * 100000 + s * 1000
+                if resample_batch_fn is not None:
+                    resample_batch_fn(probe_seed)
+                loss = self._probe_at_lr(loss_fn, lr, probe_seed)
+                total_loss += loss
+            avg_loss = total_loss / n_seeds
+            results.append((lr, avg_loss))
+            log(f"    [{i+1}/{len(lrs)}] lr={lr:.2e} -> loss={avg_loss:.4f}")
+
+        best_lr, best_loss = min(results, key=lambda x: x[1])
+        log(f"  Line search complete: best lr={best_lr:.2e} (loss={best_loss:.4f})")
+        return best_lr
+
+    def _probe_at_lr(self, loss_fn, test_lr, seed):
+        """Probe loss after one MeZO step with test_lr."""
+        torch.manual_seed(seed)
+        packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+
+        # Apply +epsilon
+        for info in self.param_info:
+            flat = info['param'].data.view(-1)
+            _unpack_and_apply[info['grid']](
+                flat, packed[info['packed_offset']:],
+                info['numel'], self.epsilon, BLOCK_SIZE=1024)
+
+        loss_plus = loss_fn()
+
+        # Apply -2*epsilon
+        for info in self.param_info:
+            flat = info['param'].data.view(-1)
+            _unpack_and_apply[info['grid']](
+                flat, packed[info['packed_offset']:],
+                info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
+
+        loss_minus = loss_fn()
+
+        # Restore to original (+epsilon)
+        for info in self.param_info:
+            flat = info['param'].data.view(-1)
+            _unpack_and_apply[info['grid']](
+                flat, packed[info['packed_offset']:],
+                info['numel'], self.epsilon, BLOCK_SIZE=1024)
+
+        del packed
+        return (loss_plus + loss_minus) / 2
+
+    def local_search_lr(self, loss_fn, current_lr, seed=0, n_seeds=10, resample_batch_fn=None):
+        """Local search: only test current_lr * 10 and current_lr / 10."""
+        candidates = [current_lr / 10, current_lr, current_lr * 10]
+        log(f"  Local search: testing {current_lr/10:.1e}, {current_lr:.1e}, {current_lr*10:.1e}")
+
+        results = []
+        for i, lr in enumerate(candidates):
+            total_loss = 0.0
+            for s in range(n_seeds):
+                probe_seed = seed + i * 100000 + s * 1000
+                if resample_batch_fn is not None:
+                    resample_batch_fn(probe_seed)
+                loss = self._probe_at_lr(loss_fn, lr, probe_seed)
+                total_loss += loss
+            avg_loss = total_loss / n_seeds
+            results.append((lr, avg_loss))
+
+        best_lr, best_loss = min(results, key=lambda x: x[1])
+        improved = best_lr != current_lr
+        return best_lr, improved
+
+
+class BackpropTrainer:
+    """
+    Standard backpropagation trainer for comparison.
+
+    Uses AdamW optimizer with gradient accumulation.
+    """
+    def __init__(self, model, lr=1e-5, accum_steps=1):
+        self.lr = lr
+        self.accum_steps = accum_steps
+        self.model = model
+
+        # Enable gradients for backprop
+        for p in model.parameters():
+            p.requires_grad = True
+
+        # Use AdamW optimizer
+        from torch.optim import AdamW
+        self.optimizer = AdamW(model.parameters(), lr=lr)
+
+        self.total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log(f"BackpropTrainer: {self.total/1e9:.2f}B params, lr={lr}, accum_steps={accum_steps}")
+
+        self._accum_count = 0
+        self._accum_loss = 0.0
+
+    def step(self, loss_fn_with_backward, iteration):
+        """
+        Perform one backprop step with gradient accumulation.
+
+        Note: loss_fn_with_backward should return the loss tensor (not .item())
+        and the loss should have requires_grad=True.
+        """
+        # Get loss and do backward
+        loss = loss_fn_with_backward()
+        scaled_loss = loss / self.accum_steps
+        scaled_loss.backward()
+
+        self._accum_loss += loss.item()
+        self._accum_count += 1
+
+        # Update weights after accumulation
+        if self._accum_count >= self.accum_steps:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            avg_loss = self._accum_loss / self._accum_count
+            self._accum_count = 0
+            self._accum_loss = 0.0
+            return avg_loss
+
+        return loss.item()
+
+    def line_search_lr(self, *args, **kwargs):
+        """Not implemented for backprop - uses fixed LR."""
+        log("  Line search not supported for backprop trainer")
+        return self.lr
+
+    def local_search_lr(self, *args, **kwargs):
+        """Not implemented for backprop."""
+        return self.lr, False
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train LLM with SPSA/RandomSearch - Adaptive LR Search')
     parser.add_argument('--model', type=str, default='facebook/opt-13b', help='Model name or path')
     parser.add_argument('--solver', type=str, default='spsa',
-                        choices=['spsa', 'random'],
-                        help='Solver: spsa (gradient estimation) or random (greedy random search)')
+                        choices=['spsa', 'random', 'mezo', 'backprop'],
+                        help='Solver: spsa (1-SPSA), mezo (MeZO baseline), random (greedy random search), or backprop')
     parser.add_argument('--task', type=str, default='static',
-                        choices=['static', 'sst2', 'rte', 'boolq', 'copa', 'cb', 'wic'],
-                        help='Task: static (overfit random batch) or classification task')
+                        choices=['static', 'sst2', 'rte', 'boolq', 'wsc', 'wic', 'squad'],
+                        help='Task: static (overfit random batch), classification task, or squad (generative)')
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='spsa-llm', help='W&B project name')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (auto-generated if not set)')
+    parser.add_argument('--accum_steps', type=int, default=1, help='Gradient accumulation steps (for backprop)')
     parser.add_argument('--n_perts', type=int, default=40, help='Perturbations per iteration')
     parser.add_argument('--n_iterations', type=int, default=1000, help='Total training iterations')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
@@ -664,12 +894,33 @@ def main():
     log("=" * 70)
     if args.solver == 'random':
         method = "RANDOM SEARCH"
+    elif args.solver == 'mezo':
+        method = "MeZO"
+    elif args.solver == 'backprop':
+        method = "BACKPROP"
     else:
-        method = "1.5-SPSA" if args.use_1_5_spsa else "SPSA"
+        method = "1.5-SPSA" if args.use_1_5_spsa else "1-SPSA"
     search_str = f" + {args.search_strategy.upper()} search" if args.search_strategy != 'none' else ""
     task_str = f" on {args.task.upper()}" if args.task != 'static' else ""
-    log(f"{method}{search_str} TRAINING{task_str}: OPT-13B (bit-packed)")
+    model_name = args.model.split('/')[-1]
+    log(f"{method}{search_str} TRAINING{task_str}: {model_name} (bit-packed)")
     log("=" * 70)
+
+    # Initialize W&B if enabled
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+            run_name = args.wandb_run_name or f"{method}_{args.task}_{model_name}_np{args.n_perts}_bs{args.batch_size}"
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=run_name,
+                config=vars(args),
+            )
+            log(f"W&B initialized: {wandb_run.url}")
+        except Exception as e:
+            log(f"W&B initialization failed: {e}")
+            wandb_run = None
 
     n_perts = args.n_perts
     n_iterations = args.n_iterations
@@ -756,120 +1007,280 @@ def main():
 
         import torch.nn.functional as F
 
-        def get_batch(split='train'):
-            """Get a random batch from the dataset."""
-            if split == 'train':
-                data = dataset.train_data
-            else:
-                data = dataset.val_data
+        # Check if this is a generative task (like SQuAD)
+        is_generative = dataset.task_type == "generative"
 
-            indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
-            batch_data = [data[i] for i in indices]
+        if is_generative:
+            # Generative task (SQuAD) - use language modeling loss
+            def get_batch(split='train'):
+                """Get a random batch from the dataset for generative task."""
+                if split == 'train':
+                    data = dataset.train_data
+                else:
+                    data = dataset.val_data
 
-            texts = [dataset.format_example(ex) for ex in batch_data]
-            labels_list = [ex[dataset.config["label_column"]] for ex in batch_data]
+                indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
+                batch_data = [data[i] for i in indices]
 
-            encodings = tokenizer(
-                texts, padding="max_length", truncation=True,
-                max_length=args.seq_len, return_tensors="pt"
-            )
-            input_ids = encodings["input_ids"].to('cuda')
-            attention_mask = encodings["attention_mask"].to('cuda')
-            labels_tensor = torch.tensor(labels_list, dtype=torch.long, device='cuda')
+                texts = [dataset.format_example(ex) for ex in batch_data]
+                answers = [dataset.get_answer(ex) for ex in batch_data]
 
-            return input_ids, attention_mask, labels_tensor
+                # Concatenate prompt + answer for training
+                texts_with_answers = [f"{t} {a}" for t, a in zip(texts, answers)]
 
-        # Create a batch for LR probing (will be resampled with different seeds)
-        probe_batch = list(get_batch('train'))  # [input_ids, attention_mask, labels]
-        label_token_ids_tensor = torch.tensor(dataset.label_token_ids, device='cuda')
+                # Get prompt lengths for loss masking
+                prompt_encodings = tokenizer(
+                    texts, padding="max_length", truncation=True,
+                    max_length=args.seq_len, return_tensors="pt"
+                )
+                prompt_lengths = prompt_encodings["attention_mask"].sum(dim=1).tolist()
 
-        def _resample_probe_batch(seed):
-            """Resample the probe batch with a given seed for reproducible variation."""
-            torch.manual_seed(seed)
-            probe_batch[0], probe_batch[1], probe_batch[2] = get_batch('train')
-        resample_probe_batch = _resample_probe_batch  # Assign to outer scope variable
+                # Full sequence encoding
+                encodings = tokenizer(
+                    texts_with_answers, padding="max_length", truncation=True,
+                    max_length=args.seq_len, return_tensors="pt"
+                )
+                input_ids = encodings["input_ids"].to('cuda')
+                attention_mask = encodings["attention_mask"].to('cuda')
 
-        def compute_loss_and_acc(input_ids, attention_mask, labels):
-            """Compute classification loss and accuracy for a batch."""
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-            batch_size = input_ids.size(0)
-            seq_lengths = attention_mask.sum(dim=1) - 1
-            final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
-            label_logits = final_logits[:, label_token_ids_tensor].float()
-            loss = F.cross_entropy(label_logits, labels)
-            preds = label_logits.argmax(dim=1)
-            acc = (preds == labels).float().mean().item()
-            return loss.item(), acc
+                return input_ids, attention_mask, prompt_lengths
 
-        def compute_loss(input_ids, attention_mask, labels):
-            """Compute classification loss for a batch (for backward compat)."""
-            loss, _ = compute_loss_and_acc(input_ids, attention_mask, labels)
-            return loss
+            # Create a batch for LR probing
+            probe_batch = list(get_batch('train'))
 
-        def probe_loss_fn():
-            """Loss on probe batch for LR probing."""
-            with torch.no_grad():
-                return compute_loss(probe_batch[0], probe_batch[1], probe_batch[2])
+            def _resample_probe_batch(seed):
+                torch.manual_seed(seed)
+                probe_batch[0], probe_batch[1], probe_batch[2] = get_batch('train')
+            resample_probe_batch = _resample_probe_batch
 
-        # Variables to hold current iteration's batch (for SPSA consistency)
-        current_batch = [None, None, None]  # [input_ids, attention_mask, labels]
+            def compute_generative_loss(input_ids, attention_mask, prompt_lengths, return_tensor=False):
+                """Compute LM loss on answer portion only."""
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                logits = outputs.logits
 
-        def sample_new_batch():
-            """Sample a new batch for the current iteration."""
-            current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
+                # Shift for causal LM
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
 
-        def loss_fn():
-            """Loss on current iteration's batch (consistent within SPSA step)."""
-            with torch.no_grad():
-                return compute_loss(current_batch[0], current_batch[1], current_batch[2])
+                batch_size, seq_len_minus_1 = shift_labels.shape
 
-        def _quick_train_acc():
-            """Quick accuracy on a random training batch."""
-            with torch.no_grad():
-                input_ids, attention_mask, labels = get_batch('train')
-                _, acc = compute_loss_and_acc(input_ids, attention_mask, labels)
-                return acc
-        quick_train_acc = _quick_train_acc  # Assign to outer variable
+                # Create mask for answer tokens only
+                answer_mask = torch.zeros(batch_size, seq_len_minus_1, device='cuda')
+                for i, prompt_len in enumerate(prompt_lengths):
+                    start_pos = max(0, prompt_len - 1)
+                    end_pos = int(attention_mask[i].sum().item()) - 1
+                    if start_pos < end_pos:
+                        answer_mask[i, start_pos:end_pos] = 1.0
 
-        def evaluate_fn(split='val'):
-            """Evaluate accuracy on a dataset split."""
-            if split == 'val':
-                data = dataset.val_data
-            else:
-                data = dataset.test_data
+                # Compute loss
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    reduction='none'
+                ).view(batch_size, seq_len_minus_1)
 
-            total_correct = 0
-            total_samples = 0
+                masked_loss = (loss * answer_mask).sum() / (answer_mask.sum() + 1e-8)
 
-            with torch.no_grad():
-                for start_idx in range(0, len(data), args.batch_size):
-                    end_idx = min(start_idx + args.batch_size, len(data))
-                    batch_data = data[start_idx:end_idx]
+                if return_tensor:
+                    return masked_loss, 0.0  # No accuracy for generative
+                return masked_loss.item(), 0.0
 
-                    texts = [dataset.format_example(ex) for ex in batch_data]
-                    labels_list = [ex[dataset.config["label_column"]] for ex in batch_data]
+            def probe_loss_fn():
+                with torch.no_grad():
+                    loss, _ = compute_generative_loss(probe_batch[0], probe_batch[1], probe_batch[2])
+                    return loss
 
-                    encodings = tokenizer(
-                        texts, padding="max_length", truncation=True,
-                        max_length=args.seq_len, return_tensors="pt"
-                    )
-                    input_ids = encodings["input_ids"].to('cuda')
-                    attention_mask = encodings["attention_mask"].to('cuda')
-                    labels_tensor = torch.tensor(labels_list, dtype=torch.long, device='cuda')
+            current_batch = [None, None, None]
 
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                    batch_size = input_ids.size(0)
-                    seq_lengths = attention_mask.sum(dim=1) - 1
-                    final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
+            def sample_new_batch():
+                current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
 
-                    label_token_ids = torch.tensor(dataset.label_token_ids, device='cuda')
-                    label_logits = final_logits[:, label_token_ids]
-                    predictions = label_logits.argmax(dim=-1)
+            def loss_fn():
+                with torch.no_grad():
+                    loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2])
+                    return loss
 
-                    total_correct += (predictions == labels_tensor).sum().item()
-                    total_samples += len(batch_data)
+            def backprop_loss_fn():
+                loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2], return_tensor=True)
+                return loss
 
-            return total_correct / total_samples if total_samples > 0 else 0.0
+            quick_train_acc = None  # No quick accuracy for generative tasks
+
+        else:
+            # Classification task
+            def get_batch(split='train'):
+                """Get a random batch from the dataset."""
+                if split == 'train':
+                    data = dataset.train_data
+                else:
+                    data = dataset.val_data
+
+                indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
+                batch_data = [data[i] for i in indices]
+
+                texts = [dataset.format_example(ex) for ex in batch_data]
+                labels_list = [ex[dataset.config["label_column"]] for ex in batch_data]
+
+                encodings = tokenizer(
+                    texts, padding="max_length", truncation=True,
+                    max_length=args.seq_len, return_tensors="pt"
+                )
+                input_ids = encodings["input_ids"].to('cuda')
+                attention_mask = encodings["attention_mask"].to('cuda')
+                labels_tensor = torch.tensor(labels_list, dtype=torch.long, device='cuda')
+
+                return input_ids, attention_mask, labels_tensor
+
+            # Create a batch for LR probing (will be resampled with different seeds)
+            probe_batch = list(get_batch('train'))  # [input_ids, attention_mask, labels]
+            label_token_ids_tensor = torch.tensor(dataset.label_token_ids, device='cuda')
+
+            def _resample_probe_batch(seed):
+                """Resample the probe batch with a given seed for reproducible variation."""
+                torch.manual_seed(seed)
+                probe_batch[0], probe_batch[1], probe_batch[2] = get_batch('train')
+            resample_probe_batch = _resample_probe_batch  # Assign to outer scope variable
+
+            def compute_loss_and_acc(input_ids, attention_mask, labels, return_tensor=False):
+                """Compute classification loss and accuracy for a batch."""
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                batch_size = input_ids.size(0)
+                seq_lengths = attention_mask.sum(dim=1) - 1
+                final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
+                label_logits = final_logits[:, label_token_ids_tensor].float()
+                loss = F.cross_entropy(label_logits, labels)
+                preds = label_logits.argmax(dim=1)
+                acc = (preds == labels).float().mean().item()
+                if return_tensor:
+                    return loss, acc
+                return loss.item(), acc
+
+            def compute_loss(input_ids, attention_mask, labels, return_tensor=False):
+                """Compute classification loss for a batch (for backward compat)."""
+                loss, _ = compute_loss_and_acc(input_ids, attention_mask, labels, return_tensor=return_tensor)
+                return loss
+
+            def probe_loss_fn():
+                """Loss on probe batch for LR probing."""
+                with torch.no_grad():
+                    return compute_loss(probe_batch[0], probe_batch[1], probe_batch[2])
+
+            # Variables to hold current iteration's batch (for SPSA consistency)
+            current_batch = [None, None, None]  # [input_ids, attention_mask, labels]
+
+            def sample_new_batch():
+                """Sample a new batch for the current iteration."""
+                current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
+
+            def loss_fn():
+                """Loss on current iteration's batch (consistent within SPSA step)."""
+                with torch.no_grad():
+                    return compute_loss(current_batch[0], current_batch[1], current_batch[2])
+
+            def backprop_loss_fn():
+                """Loss with gradient for backprop."""
+                return compute_loss(current_batch[0], current_batch[1], current_batch[2], return_tensor=True)
+
+            def _quick_train_acc():
+                """Quick accuracy on a random training batch."""
+                with torch.no_grad():
+                    input_ids, attention_mask, labels = get_batch('train')
+                    _, acc = compute_loss_and_acc(input_ids, attention_mask, labels)
+                    return acc
+            quick_train_acc = _quick_train_acc  # Assign to outer variable
+
+        if is_generative:
+            # Generative evaluation (SQuAD) - use F1 score
+            from tasks.tasks_llm import compute_squad_f1, normalize_answer
+
+            def evaluate_fn(split='val'):
+                """Evaluate F1 score on a dataset split for generative task."""
+                if split == 'val':
+                    data = dataset.val_data
+                else:
+                    data = dataset.test_data
+
+                total_f1 = 0.0
+                total_samples = 0
+
+                with torch.no_grad():
+                    for start_idx in range(0, len(data), args.batch_size):
+                        end_idx = min(start_idx + args.batch_size, len(data))
+                        batch_data = data[start_idx:end_idx]
+
+                        texts = [dataset.format_example(ex) for ex in batch_data]
+                        gold_answers = [dataset.get_answer(ex) for ex in batch_data]
+
+                        encodings = tokenizer(
+                            texts, padding="max_length", truncation=True,
+                            max_length=args.seq_len, return_tensors="pt"
+                        )
+                        input_ids = encodings["input_ids"].to('cuda')
+                        attention_mask = encodings["attention_mask"].to('cuda')
+
+                        # Generate predictions
+                        outputs = model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=50,
+                            num_beams=1,
+                            do_sample=False,
+                            pad_token_id=tokenizer.pad_token_id,
+                        )
+
+                        # Decode predictions (only new tokens)
+                        for i, (output, gold) in enumerate(zip(outputs, gold_answers)):
+                            prompt_len = input_ids[i].shape[0]
+                            pred_tokens = output[prompt_len:]
+                            pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+
+                            # Compute F1
+                            f1 = compute_squad_f1(pred_text, gold)
+                            total_f1 += f1
+                            total_samples += 1
+
+                return total_f1 / total_samples if total_samples > 0 else 0.0
+        else:
+            # Classification evaluation
+            def evaluate_fn(split='val'):
+                """Evaluate accuracy on a dataset split."""
+                if split == 'val':
+                    data = dataset.val_data
+                else:
+                    data = dataset.test_data
+
+                total_correct = 0
+                total_samples = 0
+
+                with torch.no_grad():
+                    for start_idx in range(0, len(data), args.batch_size):
+                        end_idx = min(start_idx + args.batch_size, len(data))
+                        batch_data = data[start_idx:end_idx]
+
+                        texts = [dataset.format_example(ex) for ex in batch_data]
+                        labels_list = [ex[dataset.config["label_column"]] for ex in batch_data]
+
+                        encodings = tokenizer(
+                            texts, padding="max_length", truncation=True,
+                            max_length=args.seq_len, return_tensors="pt"
+                        )
+                        input_ids = encodings["input_ids"].to('cuda')
+                        attention_mask = encodings["attention_mask"].to('cuda')
+                        labels_tensor = torch.tensor(labels_list, dtype=torch.long, device='cuda')
+
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                        batch_size = input_ids.size(0)
+                        seq_lengths = attention_mask.sum(dim=1) - 1
+                        final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
+
+                        label_token_ids = torch.tensor(dataset.label_token_ids, device='cuda')
+                        label_logits = final_logits[:, label_token_ids]
+                        predictions = label_logits.argmax(dim=-1)
+
+                        total_correct += (predictions == labels_tensor).sum().item()
+                        total_samples += len(batch_data)
+
+                return total_correct / total_samples if total_samples > 0 else 0.0
 
         log(f"Dataset loaded: train={len(dataset.train_data)}, val={len(dataset.val_data)}")
 
@@ -892,6 +1303,10 @@ def main():
     # Create trainer based on solver choice
     if args.solver == 'random':
         trainer = RandomSearchTrainer(model, epsilon=epsilon, n_perts=n_perts)
+    elif args.solver == 'mezo':
+        trainer = MeZOTrainer(model, lr=lr, epsilon=epsilon)
+    elif args.solver == 'backprop':
+        trainer = BackpropTrainer(model, lr=lr, accum_steps=args.accum_steps)
     else:  # spsa
         trainer = SPSATrainer(model, lr=lr, epsilon=epsilon, n_perts=n_perts,
                               use_curvature=args.use_1_5_spsa,
@@ -958,7 +1373,12 @@ def main():
         # Unless --static_batch is set, then use the same batch throughout
         if args.task != 'static' and not args.static_batch:
             sample_new_batch()
-        loss = trainer.step(loss_fn, i)
+
+        # Use appropriate loss function for solver
+        if args.solver == 'backprop':
+            loss = trainer.step(backprop_loss_fn, i)
+        else:
+            loss = trainer.step(loss_fn, i)
         losses.append(loss)
 
         # Update EMA
@@ -1068,11 +1488,35 @@ def main():
         log(f"Iter {i:6d} | Loss: {loss:.4f}{acc_str} | Best: {best:.4f}{ema_str} | "
             f"Red: {initial_loss/loss:.2f}x | lr={lr:.0e} eps={epsilon:.0e} | {avg:.1f}s/it | ETA: {eta/3600:.1f}h")
 
+        # W&B logging
+        if wandb_run is not None:
+            log_dict = {
+                "iteration": i,
+                "loss": loss,
+                "best_loss": best,
+                "lr": lr,
+                "epsilon": epsilon,
+                "loss_reduction": initial_loss / loss if loss > 0 else 0,
+            }
+            if quick_train_acc is not None:
+                log_dict["train_acc"] = train_acc
+            if args.search_strategy != 'none':
+                log_dict["loss_ema"] = loss_ema
+            wandb_run.log(log_dict)
+
         # Periodic evaluation for tasks (val AND test)
         if evaluate_fn and (i + 1) % args.eval_interval == 0:
             val_acc = evaluate_fn('val')
             test_acc = evaluate_fn('test')
             log(f"  >>> [Eval] Val: {val_acc:.4f} ({val_acc*100:.1f}%) | Test: {test_acc:.4f} ({test_acc*100:.1f}%)")
+
+            # W&B logging for eval
+            if wandb_run is not None:
+                wandb_run.log({
+                    "iteration": i,
+                    "val_acc": val_acc,
+                    "test_acc": test_acc,
+                })
 
             # Checkpoint on best test accuracy
             if test_acc > best_test_acc:
@@ -1084,8 +1528,8 @@ def main():
                     'model_state_dict': {k: v.cpu().clone() for k, v in model.state_dict().items()},
                     'losses': losses,
                     'best': best,
-                    'lr': trainer.lr,
-                    'epsilon': trainer.epsilon,
+                    'lr': trainer.lr if hasattr(trainer, 'lr') else lr,
+                    'epsilon': trainer.epsilon if hasattr(trainer, 'epsilon') else epsilon,
                     'val_acc': val_acc,
                     'test_acc': test_acc,
                     'args': vars(args),
@@ -1093,6 +1537,10 @@ def main():
                 ckpt_path = f'checkpoints/best_{args.task}_np{args.n_perts}_bs{args.batch_size}.pt'
                 torch.save(ckpt, ckpt_path)
                 log(f"  >>> NEW BEST TEST! Checkpoint saved: {ckpt_path}")
+
+                # W&B best metrics
+                if wandb_run is not None:
+                    wandb_run.log({"best_test_acc": best_test_acc})
         last_t = now
         last_i = i
 
@@ -1115,6 +1563,12 @@ def main():
     if args.search_strategy != 'none':
         log(f"Total searches: {search_count}")
 
+    # Final W&B summary
+    if wandb_run is not None:
+        wandb_run.summary["final_loss"] = losses[-1]
+        wandb_run.summary["loss_reduction"] = initial_loss / losses[-1] if losses[-1] > 0 else 0
+        wandb_run.summary["best_loss"] = best
+
     # Final evaluation for tasks
     if evaluate_fn:
         log("=" * 70)
@@ -1125,8 +1579,18 @@ def main():
         try:
             final_test_acc = evaluate_fn('test')
             log(f"Final Test Accuracy: {final_test_acc:.4f} ({final_test_acc*100:.1f}%)")
+
+            # W&B final summary
+            if wandb_run is not None:
+                wandb_run.summary["final_val_acc"] = final_val_acc
+                wandb_run.summary["final_test_acc"] = final_test_acc
+                wandb_run.summary["best_test_acc"] = best_test_acc
         except Exception as e:
             log(f"Test evaluation skipped: {e}")
+
+    # Close W&B
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

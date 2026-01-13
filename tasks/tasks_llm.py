@@ -5,11 +5,11 @@ Implements the 6 benchmarks from MeZO paper:
 - SST-2: Sentiment Analysis (binary)
 - RTE: Recognizing Textual Entailment (binary)
 - BoolQ: Boolean Question Answering (binary)
-- COPA: Choice of Plausible Alternatives (binary)
-- CB: CommitmentBank (3-way)
+- WSC: Winograd Schema Challenge (binary)
 - WiC: Word-in-Context (binary)
+- SQuAD: Stanford Question Answering Dataset (extractive QA)
 
-Each task is formatted as a text-to-label classification problem.
+Each task is formatted as a text-to-label classification problem (except SQuAD which is generative).
 Following MeZO paper: 1000/500/1000 train/val/test splits.
 """
 import os
@@ -33,6 +33,7 @@ TASK_CONFIG = {
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
+        "task_type": "classification",
     },
     "rte": {
         "dataset_name": "glue",
@@ -45,6 +46,7 @@ TASK_CONFIG = {
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
+        "task_type": "classification",
     },
     "boolq": {
         "dataset_name": "super_glue",
@@ -57,30 +59,20 @@ TASK_CONFIG = {
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
+        "task_type": "classification",
     },
-    "copa": {
+    "wsc": {
         "dataset_name": "super_glue",
-        "dataset_config": "copa",
-        "text_columns": ["premise", "choice1", "choice2", "question"],
+        "dataset_config": "wsc",
+        "text_columns": ["text", "span1_text", "span2_text"],
         "label_column": "label",
         "num_labels": 2,
-        "label_names": ["1", "2"],
-        "prompt_template": "{premise}\nQuestion: What is the {question}?\nChoice 1: {choice1}\nChoice 2: {choice2}\nAnswer:",
-        "train_size": 400,
-        "val_size": 100,
-        "test_size": 500,
-    },
-    "cb": {
-        "dataset_name": "super_glue",
-        "dataset_config": "cb",
-        "text_columns": ["premise", "hypothesis"],
-        "label_column": "label",
-        "num_labels": 3,
-        "label_names": ["yes", "no", "maybe"],
-        "prompt_template": "{premise}\nQuestion: Does this imply that \"{hypothesis}\"? Answer:",
-        "train_size": 250,
-        "val_size": 57,
-        "test_size": 250,
+        "label_names": ["no", "yes"],
+        "prompt_template": "{text}\nQuestion: In the above sentence, does \"{span2_text}\" refer to \"{span1_text}\"? Answer:",
+        "train_size": 554,  # WSC has limited data
+        "val_size": 104,
+        "test_size": 146,
+        "task_type": "classification",
     },
     "wic": {
         "dataset_name": "super_glue",
@@ -93,6 +85,20 @@ TASK_CONFIG = {
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
+        "task_type": "classification",
+    },
+    "squad": {
+        "dataset_name": "squad",
+        "dataset_config": None,
+        "text_columns": ["context", "question"],
+        "label_column": "answers",  # Special handling for SQuAD answers
+        "num_labels": None,  # Generative task
+        "label_names": None,  # Generative task
+        "prompt_template": "Context: {context}\n\nQuestion: {question}\n\nAnswer:",
+        "train_size": 1000,
+        "val_size": 500,
+        "test_size": 1000,
+        "task_type": "generative",
     },
 }
 
@@ -126,12 +132,16 @@ class LLMTaskDataset:
         self.config = TASK_CONFIG[self.task_name]
         self.num_labels = self.config["num_labels"]
         self.label_names = self.config["label_names"]
+        self.task_type = self.config.get("task_type", "classification")
 
         # Load and prepare datasets
         self._load_datasets()
 
-        # Get label token ids for classification
-        self._setup_label_tokens()
+        # Get label token ids for classification (skip for generative tasks)
+        if self.task_type == "classification":
+            self._setup_label_tokens()
+        else:
+            self.label_token_ids = None
 
     def _load_datasets(self):
         """Load and split the dataset according to MeZO paper splits."""
@@ -139,11 +149,18 @@ class LLMTaskDataset:
         dataset_config = self.config["dataset_config"]
 
         # Load from HuggingFace datasets
-        dataset = load_dataset(
-            dataset_name,
-            dataset_config,
-            cache_dir=self.cache_dir,
-        )
+        if dataset_config is not None:
+            dataset = load_dataset(
+                dataset_name,
+                dataset_config,
+                cache_dir=self.cache_dir,
+            )
+        else:
+            # For datasets without a config (like squad)
+            dataset = load_dataset(
+                dataset_name,
+                cache_dir=self.cache_dir,
+            )
 
         # Get splits
         train_data = dataset.get("train", None)
@@ -236,19 +253,34 @@ class LLMTaskDataset:
 
         return template.format(**format_dict)
 
+    def get_answer(self, example: Dict) -> str:
+        """Get the answer for an example (for generative tasks like SQuAD)."""
+        if self.task_type == "generative" and self.task_name == "squad":
+            answers = example.get("answers", {})
+            answer_texts = answers.get("text", [])
+            if answer_texts:
+                return answer_texts[0]  # Return first answer
+            return ""
+        else:
+            # For classification, return the label name
+            label_idx = example[self.config["label_column"]]
+            if self.label_names and 0 <= label_idx < len(self.label_names):
+                return self.label_names[label_idx]
+            return str(label_idx)
+
     def get_batch(
         self,
         split: str,
         batch_size: int,
         device: str = "cuda",
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Any]:
         """
         Get a batch of examples.
 
         Returns:
             input_ids: [batch_size, seq_len] tokenized inputs
             attention_mask: [batch_size, seq_len] attention mask
-            labels: [batch_size] integer labels
+            labels: [batch_size] integer labels for classification, or List[str] answers for generative
         """
         if split == "train":
             data = self.train_data
@@ -268,22 +300,54 @@ class LLMTaskDataset:
 
         # Format examples
         texts = [self.format_example(ex) for ex in batch_examples]
-        labels = [ex[self.config["label_column"]] for ex in batch_examples]
 
-        # Tokenize
-        encodings = self.tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
+        if self.task_type == "classification":
+            labels = [ex[self.config["label_column"]] for ex in batch_examples]
+            # Tokenize
+            encodings = self.tokenizer(
+                texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            input_ids = encodings["input_ids"].to(device)
+            attention_mask = encodings["attention_mask"].to(device)
+            labels_tensor = torch.tensor(labels, dtype=torch.long, device=device)
+            return input_ids, attention_mask, labels_tensor
+        else:
+            # Generative task (e.g., SQuAD)
+            answers = [self.get_answer(ex) for ex in batch_examples]
 
-        input_ids = encodings["input_ids"].to(device)
-        attention_mask = encodings["attention_mask"].to(device)
-        labels_tensor = torch.tensor(labels, dtype=torch.long, device=device)
+            # For training, we concatenate prompt + answer and use LM loss
+            texts_with_answers = [f"{t} {a}" for t, a in zip(texts, answers)]
 
-        return input_ids, attention_mask, labels_tensor
+            # Tokenize prompt only (for generation evaluation)
+            prompt_encodings = self.tokenizer(
+                texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+
+            # Tokenize full sequence (prompt + answer) for training loss
+            full_encodings = self.tokenizer(
+                texts_with_answers,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+
+            input_ids = full_encodings["input_ids"].to(device)
+            attention_mask = full_encodings["attention_mask"].to(device)
+
+            # For generative tasks, return answers as strings for evaluation
+            # and prompt lengths for loss masking
+            prompt_lengths = prompt_encodings["attention_mask"].sum(dim=1).tolist()
+
+            return input_ids, attention_mask, {"answers": answers, "prompt_lengths": prompt_lengths}
 
     def get_full_split(
         self,
@@ -419,6 +483,104 @@ def compute_llm_classification_accuracy(
     return correct / total if total > 0 else 0.0
 
 
+def normalize_answer(s: str) -> str:
+    """Normalize answer for SQuAD evaluation."""
+    import re
+    import string
+
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+
+def compute_squad_f1(prediction: str, ground_truth: str) -> float:
+    """Compute F1 score for a single SQuAD prediction."""
+    pred_tokens = normalize_answer(prediction).split()
+    truth_tokens = normalize_answer(ground_truth).split()
+
+    if len(pred_tokens) == 0 or len(truth_tokens) == 0:
+        return int(pred_tokens == truth_tokens)
+
+    common = set(pred_tokens) & set(truth_tokens)
+    num_same = len(common)
+
+    if num_same == 0:
+        return 0.0
+
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(truth_tokens)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1
+
+
+def compute_squad_exact_match(prediction: str, ground_truth: str) -> float:
+    """Compute exact match score for a single SQuAD prediction."""
+    return float(normalize_answer(prediction) == normalize_answer(ground_truth))
+
+
+def compute_generative_loss(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: List[int],
+) -> torch.Tensor:
+    """
+    Compute language modeling loss only on the answer portion (after prompt).
+
+    Args:
+        logits: [batch_size, seq_len, vocab_size] model output logits
+        input_ids: [batch_size, seq_len] input token ids (prompt + answer)
+        attention_mask: [batch_size, seq_len] attention mask
+        prompt_lengths: List of prompt lengths (answer starts after this)
+
+    Returns:
+        Cross-entropy loss on answer tokens only
+    """
+    batch_size, seq_len, vocab_size = logits.shape
+    device = logits.device
+
+    # Shift for causal LM: predict next token
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+
+    # Create mask for answer tokens only (after prompt)
+    answer_mask = torch.zeros(batch_size, seq_len - 1, device=device)
+    for i, prompt_len in enumerate(prompt_lengths):
+        # Answer tokens start at position prompt_len (0-indexed)
+        # After shift, we want positions from prompt_len-1 onwards
+        start_pos = max(0, prompt_len - 1)
+        end_pos = attention_mask[i].sum().item() - 1  # Last non-padding position
+        if start_pos < end_pos:
+            answer_mask[i, start_pos:end_pos] = 1.0
+
+    # Compute cross-entropy loss
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+    answer_mask = answer_mask.view(-1)
+
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits, shift_labels, reduction='none'
+    )
+
+    # Apply mask and average
+    masked_loss = loss * answer_mask
+    if answer_mask.sum() > 0:
+        return masked_loss.sum() / answer_mask.sum()
+    else:
+        return masked_loss.sum()  # Will be 0
+
+
 def get_task_dataset(
     task_name: str,
     tokenizer: Any,
@@ -430,7 +592,7 @@ def get_task_dataset(
     Factory function to create a task dataset.
 
     Args:
-        task_name: One of 'sst2', 'rte', 'boolq', 'copa', 'cb', 'wic'
+        task_name: One of 'sst2', 'rte', 'boolq', 'wsc', 'wic', 'squad'
         tokenizer: HuggingFace tokenizer
         max_length: Maximum sequence length
         seed: Random seed for reproducibility
@@ -469,8 +631,11 @@ def test_task_loading():
 
     # Load a small tokenizer for testing
     tokenizer = AutoTokenizer.from_pretrained("facebook/opt-125m")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    for task_name in ["sst2", "rte", "boolq"]:
+    # Test classification tasks
+    for task_name in ["sst2", "rte", "boolq", "wsc", "wic"]:
         print(f"\nTesting {task_name}...")
         dataset = get_task_dataset(task_name, tokenizer, max_length=128)
 
@@ -479,6 +644,16 @@ def test_task_loading():
         print(f"  Input shape: {input_ids.shape}")
         print(f"  Labels: {labels.tolist()}")
         print(f"  Label token IDs: {dataset.label_token_ids}")
+        print(f"  Task type: {dataset.task_type}")
+
+    # Test generative task (SQuAD)
+    print(f"\nTesting squad...")
+    dataset = get_task_dataset("squad", tokenizer, max_length=256)
+    input_ids, attention_mask, labels_info = dataset.get_batch("train", batch_size=2)
+    print(f"  Input shape: {input_ids.shape}")
+    print(f"  Answers: {labels_info['answers']}")
+    print(f"  Prompt lengths: {labels_info['prompt_lengths']}")
+    print(f"  Task type: {dataset.task_type}")
 
     print("\nAll tests passed!")
 
