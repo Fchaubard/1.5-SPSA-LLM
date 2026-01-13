@@ -52,7 +52,8 @@ def _unpack_and_accumulate(grad_ptr, packed_ptr, n_elements, coeff, BLOCK_SIZE: 
 class SPSATrainer:
     def __init__(self, model, lr=1e-4, epsilon=1e-4, n_perts=40,
                  use_curvature=False, saturating_alpha=0.1, lambda_reg=1.0,
-                 memory_efficient=False):
+                 memory_efficient=False,
+                 accum_steps=1):
         self.lr = lr
         self.epsilon = epsilon
         self.n_perts = n_perts
@@ -60,6 +61,7 @@ class SPSATrainer:
         self.saturating_alpha = saturating_alpha
         self.lambda_reg = lambda_reg
         self.memory_efficient = memory_efficient
+        self.accum_steps = accum_steps
 
         self.params = [p for p in model.parameters() if p.requires_grad]
         self.total = sum(p.numel() for p in self.params)
@@ -87,7 +89,8 @@ class SPSATrainer:
             self.grads = None
 
         mode_str = " [MEMORY EFFICIENT]" if memory_efficient else ""
-        log(f"SPSATrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB{mode_str}")
+        accum_str = f", accum={accum_steps}" if accum_steps > 1 else ""
+        log(f"SPSATrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB{mode_str}{accum_str}")
 
     def probe_loss_at_lr(self, loss_fn, test_lr, seed=0, accum_batches=1):
         """
@@ -435,7 +438,10 @@ class SPSATrainer:
 
         # For 1.5-SPSA, get clean loss once per iteration
         if self.use_curvature:
-            loss_clean = loss_fn()
+            loss_clean = 0.0
+            for _ in range(self.accum_steps):
+                loss_clean += loss_fn()
+            loss_clean /= self.accum_steps
 
         for pert_idx in range(self.n_perts):
             # Generate bit-packed random (8x less data!)
@@ -449,7 +455,11 @@ class SPSATrainer:
                     flat, packed[info['packed_offset']:],
                     info['numel'], self.epsilon, BLOCK_SIZE=1024)
 
-            loss_plus = loss_fn()
+            # Accumulate loss_plus over accum_steps batches
+            loss_plus = 0.0
+            for _ in range(self.accum_steps):
+                loss_plus += loss_fn()
+            loss_plus /= self.accum_steps
 
             # Apply -2*epsilon
             for info in self.param_info:
@@ -458,7 +468,11 @@ class SPSATrainer:
                     flat, packed[info['packed_offset']:],
                     info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
 
-            loss_minus = loss_fn()
+            # Accumulate loss_minus over accum_steps batches
+            loss_minus = 0.0
+            for _ in range(self.accum_steps):
+                loss_minus += loss_fn()
+            loss_minus /= self.accum_steps
 
             # Restore
             for info in self.param_info:
@@ -498,7 +512,10 @@ class SPSATrainer:
         grad_coeffs = []
 
         if self.use_curvature:
-            loss_clean = loss_fn()
+            loss_clean = 0.0
+            for _ in range(self.accum_steps):
+                loss_clean += loss_fn()
+            loss_clean /= self.accum_steps
 
         for pert_idx in range(self.n_perts):
             torch.manual_seed(iteration * 10000 + pert_idx)
@@ -510,7 +527,11 @@ class SPSATrainer:
                     flat, packed[info['packed_offset']:],
                     info['numel'], self.epsilon, BLOCK_SIZE=1024)
 
-            loss_plus = loss_fn()
+            # Accumulate loss_plus over accum_steps batches
+            loss_plus = 0.0
+            for _ in range(self.accum_steps):
+                loss_plus += loss_fn()
+            loss_plus /= self.accum_steps
 
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
@@ -518,7 +539,11 @@ class SPSATrainer:
                     flat, packed[info['packed_offset']:],
                     info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
 
-            loss_minus = loss_fn()
+            # Accumulate loss_minus over accum_steps batches
+            loss_minus = 0.0
+            for _ in range(self.accum_steps):
+                loss_minus += loss_fn()
+            loss_minus /= self.accum_steps
 
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
@@ -1003,7 +1028,7 @@ def main():
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='spsa-llm', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (auto-generated if not set)')
-    parser.add_argument('--accum_steps', type=int, default=1, help='Gradient accumulation steps (for backprop)')
+    parser.add_argument('--accum_steps', type=int, default=1, help='Batch accumulation steps (effective_batch = batch_size * accum_steps)')
     parser.add_argument('--n_perts', type=int, default=40, help='Perturbations per iteration')
     parser.add_argument('--n_iterations', type=int, default=1000, help='Total training iterations')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
@@ -1461,7 +1486,8 @@ def main():
                               use_curvature=args.use_1_5_spsa,
                               saturating_alpha=args.saturating_alpha,
                               lambda_reg=args.lambda_reg,
-                              memory_efficient=args.memory_efficient)
+                              memory_efficient=args.memory_efficient,
+                              accum_steps=args.accum_steps)
 
     # Parse explicit LR points if provided
     explicit_lrs = None
