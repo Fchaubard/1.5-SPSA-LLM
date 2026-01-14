@@ -1264,27 +1264,18 @@ def main():
                     loss, _ = compute_generative_loss(probe_batch[0], probe_batch[1], probe_batch[2])
                     return loss
 
-            # Variables to hold current iteration's batches (for SPSA consistency)
-            batch_list = []  # List of (input_ids, attention_mask, prompt_lengths) tuples
+            current_batch = [None, None, None]
 
-            def sample_new_batch(n_batches=1):
-                """Sample n_batches for the current iteration (for gradient accumulation)."""
-                batch_list.clear()
-                for _ in range(n_batches):
-                    batch_list.append(get_batch('train'))
+            def sample_new_batch():
+                current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
 
-            def loss_fn(batch_idx=0):
-                """Loss on batch at given index (for consistent +/- perturbation evaluation)."""
+            def loss_fn():
                 with torch.no_grad():
-                    idx = batch_idx % len(batch_list) if batch_list else 0
-                    batch = batch_list[idx] if batch_list else get_batch('train')
-                    loss, _ = compute_generative_loss(batch[0], batch[1], batch[2])
+                    loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2])
                     return loss
 
             def backprop_loss_fn():
-                """Loss with gradient for backprop (uses first batch in list)."""
-                batch = batch_list[0] if batch_list else get_batch('train')
-                loss, _ = compute_generative_loss(batch[0], batch[1], batch[2], return_tensor=True)
+                loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2], return_tensor=True)
                 return loss
 
             quick_train_acc = None  # No quick accuracy for generative tasks
@@ -1475,14 +1466,13 @@ def main():
 
     log("Warmup...")
     # Initialize batch for tasks (sample_new_batch was defined above for tasks)
-    # Sample accum_steps batches for proper gradient accumulation
     if args.task != 'static':
-        sample_new_batch(args.accum_steps)
+        sample_new_batch()
     for _ in range(3):
-        _ = loss_fn(0)
+        _ = loss_fn()
     if args.task != 'static':
-        sample_new_batch(args.accum_steps)
-    initial_loss = loss_fn(0)
+        sample_new_batch()
+    initial_loss = loss_fn()
     log(f"Initial loss: {initial_loss:.4f}")
 
     # Initial evaluation for tasks
@@ -1561,8 +1551,9 @@ def main():
     lr_decay_count = 0  # Number of LR decays performed
 
     for i in range(n_iterations):
-        # Sample accum_steps fresh batches for this iteration
-        # This ensures loss_plus and loss_minus use the SAME batches for proper gradient estimation
+        # Sample fresh batches for this iteration (ensures consistency within SPSA step)
+        # We sample accum_steps batches so loss_plus and loss_minus use the SAME batches
+        # Unless --static_batch is set, then use the same batch throughout
         if args.task != 'static' and not args.static_batch:
             sample_new_batch(args.accum_steps)
 
