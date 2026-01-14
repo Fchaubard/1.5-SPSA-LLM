@@ -1169,6 +1169,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = 'left'  # Required for decoder-only models
 
         from tasks.tasks_llm import get_task_dataset
         dataset = get_task_dataset(
