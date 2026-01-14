@@ -52,7 +52,8 @@ def _unpack_and_accumulate(grad_ptr, packed_ptr, n_elements, coeff, BLOCK_SIZE: 
 class SPSATrainer:
     def __init__(self, model, lr=1e-4, epsilon=1e-4, n_perts=40,
                  use_curvature=False, saturating_alpha=0.1, lambda_reg=1.0,
-                 memory_efficient=False):
+                 memory_efficient=False,
+                 accum_steps=1):
         self.lr = lr
         self.epsilon = epsilon
         self.n_perts = n_perts
@@ -60,6 +61,7 @@ class SPSATrainer:
         self.saturating_alpha = saturating_alpha
         self.lambda_reg = lambda_reg
         self.memory_efficient = memory_efficient
+        self.accum_steps = accum_steps
 
         self.params = [p for p in model.parameters() if p.requires_grad]
         self.total = sum(p.numel() for p in self.params)
@@ -87,7 +89,8 @@ class SPSATrainer:
             self.grads = None
 
         mode_str = " [MEMORY EFFICIENT]" if memory_efficient else ""
-        log(f"SPSATrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB{mode_str}")
+        accum_str = f", accum={accum_steps}" if accum_steps > 1 else ""
+        log(f"SPSATrainer: {self.total/1e9:.2f}B params, packed={self.packed_size/1e6:.0f}MB{mode_str}{accum_str}")
 
     def probe_loss_at_lr(self, loss_fn, test_lr, seed=0, accum_batches=1):
         """
@@ -180,20 +183,17 @@ class SPSATrainer:
         return loss_after
 
     def _probe_loss_at_lr_memory_efficient(self, loss_fn, test_lr, seed=0, accum_batches=1):
-        """Memory-efficient version of probe_loss_at_lr - regenerates directions via RNG."""
+        """Memory-efficient version of probe_loss_at_lr. Regenerates directions via RNG."""
         test_eps = test_lr
         grad_coeffs = []
 
-        # For 1.5-SPSA, get clean loss
         if self.use_curvature:
             loss_clean = loss_fn()
 
-        # Pass 1: Compute all gradient coefficients
         for pert_idx in range(self.n_perts):
             torch.manual_seed(seed * 10000 + pert_idx)
             packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
 
-            # Apply +epsilon
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
@@ -205,7 +205,6 @@ class SPSATrainer:
                 loss_plus += loss_fn()
             loss_plus /= accum_batches
 
-            # Apply -2*epsilon
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
@@ -217,14 +216,12 @@ class SPSATrainer:
                 loss_minus += loss_fn()
             loss_minus /= accum_batches
 
-            # Restore
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
                     flat, packed[info['packed_offset']:],
                     info['numel'], test_eps, BLOCK_SIZE=1024)
 
-            # Compute gradient coefficient
             if self.use_curvature:
                 curv = abs(loss_plus - 2*loss_clean + loss_minus) / (test_eps ** 2)
                 curvature = max(curv ** self.saturating_alpha, self.lambda_reg)
@@ -235,7 +232,6 @@ class SPSATrainer:
             grad_coeffs.append(grad_coeff)
             del packed
 
-        # Pass 2: Apply step temporarily (regenerate directions)
         for pert_idx, grad_coeff in enumerate(grad_coeffs):
             torch.manual_seed(seed * 10000 + pert_idx)
             packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
@@ -246,13 +242,11 @@ class SPSATrainer:
                     info['numel'], -test_lr * grad_coeff, BLOCK_SIZE=1024)
             del packed
 
-        # Measure loss after step
         loss_after = 0.0
         for _ in range(accum_batches):
             loss_after += loss_fn()
         loss_after /= accum_batches
 
-        # Pass 3: Restore weights (regenerate directions, apply opposite)
         for pert_idx, grad_coeff in enumerate(grad_coeffs):
             torch.manual_seed(seed * 10000 + pert_idx)
             packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
@@ -444,7 +438,10 @@ class SPSATrainer:
 
         # For 1.5-SPSA, get clean loss once per iteration
         if self.use_curvature:
-            loss_clean = loss_fn()
+            loss_clean = 0.0
+            for batch_idx in range(self.accum_steps):
+                loss_clean += loss_fn(batch_idx)
+            loss_clean /= self.accum_steps
 
         for pert_idx in range(self.n_perts):
             # Generate bit-packed random (8x less data!)
@@ -458,7 +455,11 @@ class SPSATrainer:
                     flat, packed[info['packed_offset']:],
                     info['numel'], self.epsilon, BLOCK_SIZE=1024)
 
-            loss_plus = loss_fn()
+            # Accumulate loss_plus over accum_steps batches (SAME batches as loss_minus)
+            loss_plus = 0.0
+            for batch_idx in range(self.accum_steps):
+                loss_plus += loss_fn(batch_idx)
+            loss_plus /= self.accum_steps
 
             # Apply -2*epsilon
             for info in self.param_info:
@@ -467,7 +468,11 @@ class SPSATrainer:
                     flat, packed[info['packed_offset']:],
                     info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
 
-            loss_minus = loss_fn()
+            # Accumulate loss_minus over accum_steps batches (SAME batches as loss_plus)
+            loss_minus = 0.0
+            for batch_idx in range(self.accum_steps):
+                loss_minus += loss_fn(batch_idx)
+            loss_minus /= self.accum_steps
 
             # Restore
             for info in self.param_info:
@@ -502,51 +507,50 @@ class SPSATrainer:
         return total_loss / self.n_perts
 
     def _step_memory_efficient(self, loss_fn, iteration):
-        """
-        Memory-efficient step: don't cache gradients, regenerate directions via RNG.
-        Uses ~26GB less memory by not storing gradient buffer.
-        Two-pass approach:
-          Pass 1: Compute all grad_coeffs (just n_perts floats)
-          Pass 2: Regenerate directions, apply -lr * grad_coeff * direction
-        """
+        """Memory-efficient step. Regenerates directions via RNG instead of caching grads."""
         total_loss = 0.0
         grad_coeffs = []
 
-        # For 1.5-SPSA, get clean loss once per iteration
         if self.use_curvature:
-            loss_clean = loss_fn()
+            loss_clean = 0.0
+            for batch_idx in range(self.accum_steps):
+                loss_clean += loss_fn(batch_idx)
+            loss_clean /= self.accum_steps
 
-        # Pass 1: Compute all gradient coefficients
         for pert_idx in range(self.n_perts):
             torch.manual_seed(iteration * 10000 + pert_idx)
             packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
 
-            # Apply +epsilon
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
                     flat, packed[info['packed_offset']:],
                     info['numel'], self.epsilon, BLOCK_SIZE=1024)
 
-            loss_plus = loss_fn()
+            # Accumulate loss_plus over accum_steps batches (SAME batches as loss_minus)
+            loss_plus = 0.0
+            for batch_idx in range(self.accum_steps):
+                loss_plus += loss_fn(batch_idx)
+            loss_plus /= self.accum_steps
 
-            # Apply -2*epsilon
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
                     flat, packed[info['packed_offset']:],
                     info['numel'], -2*self.epsilon, BLOCK_SIZE=1024)
 
-            loss_minus = loss_fn()
+            # Accumulate loss_minus over accum_steps batches (SAME batches as loss_plus)
+            loss_minus = 0.0
+            for batch_idx in range(self.accum_steps):
+                loss_minus += loss_fn(batch_idx)
+            loss_minus /= self.accum_steps
 
-            # Restore
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
                     flat, packed[info['packed_offset']:],
                     info['numel'], self.epsilon, BLOCK_SIZE=1024)
 
-            # Compute gradient coefficient
             if self.use_curvature:
                 curv = abs(loss_plus - 2*loss_clean + loss_minus) / (self.epsilon ** 2)
                 curvature = max(curv ** self.saturating_alpha, self.lambda_reg)
@@ -558,12 +562,10 @@ class SPSATrainer:
             total_loss += (loss_plus + loss_minus) / 2
             del packed
 
-        # Pass 2: Regenerate directions and apply updates directly
         for pert_idx, grad_coeff in enumerate(grad_coeffs):
             torch.manual_seed(iteration * 10000 + pert_idx)
             packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
 
-            # Apply -lr * grad_coeff * direction directly to params
             for info in self.param_info:
                 flat = info['param'].data.view(-1)
                 _unpack_and_apply[info['grid']](
@@ -1026,7 +1028,7 @@ def main():
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='spsa-llm', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (auto-generated if not set)')
-    parser.add_argument('--accum_steps', type=int, default=1, help='Gradient accumulation steps (for backprop)')
+    parser.add_argument('--accum_steps', type=int, default=1, help='Batch accumulation steps (effective_batch = batch_size * accum_steps)')
     parser.add_argument('--n_perts', type=int, default=40, help='Perturbations per iteration')
     parser.add_argument('--n_iterations', type=int, default=1000, help='Total training iterations')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
@@ -1038,7 +1040,7 @@ def main():
     parser.add_argument('--use_1_5_spsa', action='store_true', help='Use 1.5-SPSA with curvature scaling')
     parser.add_argument('--saturating_alpha', type=float, default=0.1, help='Exponent for saturating curvature')
     parser.add_argument('--lambda_reg', type=float, default=1.0, help='Minimum curvature regularization')
-    parser.add_argument('--memory_efficient', action='store_true', help='Memory-efficient mode: regenerate directions via RNG instead of caching gradients (saves ~26GB for 13B model)')
+    parser.add_argument('--memory_efficient', action='store_true', help='Memory efficient mode: regenerate directions via RNG instead of caching gradients')
 
     # Adaptive search options
     parser.add_argument('--search_strategy', type=str, default='none',
@@ -1125,8 +1127,6 @@ def main():
         log(f"  diverge_threshold: {args.diverge_threshold}")
     if args.use_1_5_spsa:
         log(f"  1.5-SPSA: saturating_alpha={args.saturating_alpha}, lambda_reg={args.lambda_reg}")
-    if args.memory_efficient:
-        log(f"  memory_efficient: True (RNG regeneration, saves ~26GB)")
     if args.task != 'static':
         log(f"  lr_decay_patience: {args.lr_decay_patience} (decay if train acc plateaus)")
         log(f"  lr_decay_factor: {args.lr_decay_factor}")
@@ -1264,18 +1264,27 @@ def main():
                     loss, _ = compute_generative_loss(probe_batch[0], probe_batch[1], probe_batch[2])
                     return loss
 
-            current_batch = [None, None, None]
+            # Variables to hold current iteration's batches (for SPSA consistency)
+            batch_list = []  # List of (input_ids, attention_mask, prompt_lengths) tuples
 
-            def sample_new_batch():
-                current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
+            def sample_new_batch(n_batches=1):
+                """Sample n_batches for the current iteration (for gradient accumulation)."""
+                batch_list.clear()
+                for _ in range(n_batches):
+                    batch_list.append(get_batch('train'))
 
-            def loss_fn():
+            def loss_fn(batch_idx=0):
+                """Loss on batch at given index (for consistent +/- perturbation evaluation)."""
                 with torch.no_grad():
-                    loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2])
+                    idx = batch_idx % len(batch_list) if batch_list else 0
+                    batch = batch_list[idx] if batch_list else get_batch('train')
+                    loss, _ = compute_generative_loss(batch[0], batch[1], batch[2])
                     return loss
 
             def backprop_loss_fn():
-                loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2], return_tensor=True)
+                """Loss with gradient for backprop (uses first batch in list)."""
+                batch = batch_list[0] if batch_list else get_batch('train')
+                loss, _ = compute_generative_loss(batch[0], batch[1], batch[2], return_tensor=True)
                 return loss
 
             quick_train_acc = None  # No quick accuracy for generative tasks
@@ -1339,21 +1348,27 @@ def main():
                 with torch.no_grad():
                     return compute_loss(probe_batch[0], probe_batch[1], probe_batch[2])
 
-            # Variables to hold current iteration's batch (for SPSA consistency)
-            current_batch = [None, None, None]  # [input_ids, attention_mask, labels]
+            # Variables to hold current iteration's batches (for SPSA consistency)
+            # We store accum_steps batches so that loss_plus and loss_minus use the SAME batches
+            batch_list = []  # List of (input_ids, attention_mask, labels) tuples
 
-            def sample_new_batch():
-                """Sample a new batch for the current iteration."""
-                current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
+            def sample_new_batch(n_batches=1):
+                """Sample n_batches for the current iteration (for gradient accumulation)."""
+                batch_list.clear()
+                for _ in range(n_batches):
+                    batch_list.append(get_batch('train'))
 
-            def loss_fn():
-                """Loss on current iteration's batch (consistent within SPSA step)."""
+            def loss_fn(batch_idx=0):
+                """Loss on batch at given index (for consistent +/- perturbation evaluation)."""
                 with torch.no_grad():
-                    return compute_loss(current_batch[0], current_batch[1], current_batch[2])
+                    idx = batch_idx % len(batch_list) if batch_list else 0
+                    batch = batch_list[idx] if batch_list else get_batch('train')
+                    return compute_loss(batch[0], batch[1], batch[2])
 
             def backprop_loss_fn():
-                """Loss with gradient for backprop."""
-                return compute_loss(current_batch[0], current_batch[1], current_batch[2], return_tensor=True)
+                """Loss with gradient for backprop (uses first batch in list)."""
+                batch = batch_list[0] if batch_list else get_batch('train')
+                return compute_loss(batch[0], batch[1], batch[2], return_tensor=True)
 
             def _quick_train_acc():
                 """Quick accuracy on a random training batch."""
@@ -1460,13 +1475,14 @@ def main():
 
     log("Warmup...")
     # Initialize batch for tasks (sample_new_batch was defined above for tasks)
+    # Sample accum_steps batches for proper gradient accumulation
     if args.task != 'static':
-        sample_new_batch()
+        sample_new_batch(args.accum_steps)
     for _ in range(3):
-        _ = loss_fn()
+        _ = loss_fn(0)
     if args.task != 'static':
-        sample_new_batch()
-    initial_loss = loss_fn()
+        sample_new_batch(args.accum_steps)
+    initial_loss = loss_fn(0)
     log(f"Initial loss: {initial_loss:.4f}")
 
     # Initial evaluation for tasks
@@ -1486,7 +1502,8 @@ def main():
                               use_curvature=args.use_1_5_spsa,
                               saturating_alpha=args.saturating_alpha,
                               lambda_reg=args.lambda_reg,
-                              memory_efficient=args.memory_efficient)
+                              memory_efficient=args.memory_efficient,
+                              accum_steps=args.accum_steps)
 
     # Parse explicit LR points if provided
     explicit_lrs = None
@@ -1544,10 +1561,10 @@ def main():
     lr_decay_count = 0  # Number of LR decays performed
 
     for i in range(n_iterations):
-        # Sample a fresh batch for this iteration (ensures consistency within SPSA step)
-        # Unless --static_batch is set, then use the same batch throughout
+        # Sample accum_steps fresh batches for this iteration
+        # This ensures loss_plus and loss_minus use the SAME batches for proper gradient estimation
         if args.task != 'static' and not args.static_batch:
-            sample_new_batch()
+            sample_new_batch(args.accum_steps)
 
         # Use appropriate loss function for solver
         if args.solver == 'backprop':
