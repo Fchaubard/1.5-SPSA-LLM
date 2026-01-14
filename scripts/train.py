@@ -1264,18 +1264,28 @@ def main():
                     loss, _ = compute_generative_loss(probe_batch[0], probe_batch[1], probe_batch[2])
                     return loss
 
-            current_batch = [None, None, None]
+            # Variables to hold current iteration's batches (for SPSA consistency)
+            # We store accum_steps batches so that loss_plus and loss_minus use the SAME batches
+            batch_list = []  # List of (input_ids, attention_mask, prompt_lengths) tuples
 
-            def sample_new_batch():
-                current_batch[0], current_batch[1], current_batch[2] = get_batch('train')
+            def sample_new_batch(n_batches=1):
+                """Sample n_batches for the current iteration (for gradient accumulation)."""
+                batch_list.clear()
+                for _ in range(n_batches):
+                    batch_list.append(get_batch('train'))
 
-            def loss_fn():
+            def loss_fn(batch_idx=0):
+                """Loss on batch at given index (for consistent +/- perturbation evaluation)."""
                 with torch.no_grad():
-                    loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2])
+                    idx = batch_idx % len(batch_list) if batch_list else 0
+                    batch = batch_list[idx] if batch_list else get_batch('train')
+                    loss, _ = compute_generative_loss(batch[0], batch[1], batch[2])
                     return loss
 
             def backprop_loss_fn():
-                loss, _ = compute_generative_loss(current_batch[0], current_batch[1], current_batch[2], return_tensor=True)
+                """Loss with gradient for backprop (uses first batch in list)."""
+                batch = batch_list[0] if batch_list else get_batch('train')
+                loss, _ = compute_generative_loss(batch[0], batch[1], batch[2], return_tensor=True)
                 return loss
 
             quick_train_acc = None  # No quick accuracy for generative tasks
