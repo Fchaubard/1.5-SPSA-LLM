@@ -1772,8 +1772,8 @@ def main():
             wandb_run.log(log_dict)
 
             # Checkpoint on best test accuracy
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
+            if last_test_acc is not None and last_test_acc > best_test_acc:
+                best_test_acc = last_test_acc
                 import os
                 os.makedirs('checkpoints', exist_ok=True)
                 ckpt = {
@@ -1783,8 +1783,8 @@ def main():
                     'best': best,
                     'lr': trainer.lr if hasattr(trainer, 'lr') else lr,
                     'epsilon': trainer.epsilon if hasattr(trainer, 'epsilon') else epsilon,
-                    'val_acc': val_acc,
-                    'test_acc': test_acc,
+                    'val_acc': last_val_acc,
+                    'test_acc': last_test_acc,
                     'args': vars(args),
                 }
                 ckpt_path = f'checkpoints/best_{args.task}_np{args.n_perts}_bs{args.batch_size}.pt'
