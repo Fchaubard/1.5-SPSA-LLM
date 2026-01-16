@@ -1029,6 +1029,7 @@ def main():
     parser.add_argument('--wandb_project', type=str, default='spsa-llm', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (auto-generated if not set)')
     parser.add_argument('--accum_steps', type=int, default=1, help='Batch accumulation steps (effective_batch = batch_size * accum_steps)')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility (sets torch, numpy, random)')
     parser.add_argument('--n_perts', type=int, default=40, help='Perturbations per iteration')
     parser.add_argument('--n_iterations', type=int, default=1000, help='Total training iterations')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
@@ -1064,6 +1065,17 @@ def main():
     parser.add_argument('--lr_min_decay', type=float, default=1e-7, help='Minimum LR after decay')
 
     args = parser.parse_args()
+
+    # Set random seeds for reproducibility
+    if args.seed is not None:
+        import random
+        import numpy as np
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     log("=" * 70)
     if args.solver == 'random':
@@ -1109,7 +1121,10 @@ def main():
     log(f"  lr: {lr}")
     log(f"  epsilon: {epsilon}")
     log(f"  batch_size: {args.batch_size}")
+    log(f"  accum_steps: {args.accum_steps}")
+    log(f"  effective_batch: {args.batch_size * args.accum_steps}")
     log(f"  seq_len: {args.seq_len}")
+    log(f"  memory_efficient: {args.memory_efficient}")
     log(f"  model: {args.model}")
     if args.task != 'static':
         log(f"  task: {args.task}")
@@ -1167,9 +1182,9 @@ def main():
         # Load tokenizer and task dataset
         log(f"Loading tokenizer and {args.task} dataset...")
         tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer.padding_side = 'left'  # Required for decoder-only models
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = 'left'  # Required for decoder-only models
 
         from tasks.tasks_llm import get_task_dataset
         dataset = get_task_dataset(
@@ -1187,14 +1202,15 @@ def main():
 
         if is_generative:
             # Generative task (SQuAD) - use language modeling loss
-            def get_batch(split='train'):
-                """Get a random batch from the dataset for generative task."""
+            def get_batch(split='train', indices=None):
+                """Get a batch from the dataset for generative task. If indices provided, use those."""
                 if split == 'train':
                     data = dataset.train_data
                 else:
                     data = dataset.val_data
 
-                indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
+                if indices is None:
+                    indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
                 batch_data = [data[i] for i in indices]
 
                 texts = [dataset.format_example(ex) for ex in batch_data]
@@ -1221,7 +1237,10 @@ def main():
                 return input_ids, attention_mask, prompt_lengths
 
             # Create a batch for LR probing
-            probe_batch = list(get_batch('train'))
+            # Generate effective_batch indices to keep RNG state consistent across batch_size/accum_steps configs
+            effective_batch = args.batch_size * args.accum_steps
+            _probe_indices = torch.randint(0, len(dataset.train_data), (effective_batch,)).tolist()
+            probe_batch = list(get_batch('train', indices=_probe_indices[:args.batch_size]))
 
             def _resample_probe_batch(seed):
                 torch.manual_seed(seed)
@@ -1270,10 +1289,19 @@ def main():
             batch_list = []  # List of (input_ids, attention_mask, prompt_lengths) tuples
 
             def sample_new_batch(n_batches=1):
-                """Sample n_batches for the current iteration (for gradient accumulation)."""
+                """Sample n_batches for the current iteration (for gradient accumulation).
+
+                Generates all indices at once for effective_batch = batch_size * n_batches,
+                then splits into n_batches chunks. This ensures identical samples regardless
+                of how batch_size/accum_steps are configured for the same effective batch.
+                """
                 batch_list.clear()
-                for _ in range(n_batches):
-                    batch_list.append(get_batch('train'))
+                effective_batch = args.batch_size * n_batches
+                all_indices = torch.randint(0, len(dataset.train_data), (effective_batch,)).tolist()
+                for i in range(n_batches):
+                    start = i * args.batch_size
+                    end = start + args.batch_size
+                    batch_list.append(get_batch('train', indices=all_indices[start:end]))
 
             def loss_fn(batch_idx=0):
                 """Loss on batch at given index (for consistent +/- perturbation evaluation)."""
@@ -1293,14 +1321,15 @@ def main():
 
         else:
             # Classification task
-            def get_batch(split='train'):
-                """Get a random batch from the dataset."""
+            def get_batch(split='train', indices=None):
+                """Get a batch from the dataset. If indices provided, use those; else sample randomly."""
                 if split == 'train':
                     data = dataset.train_data
                 else:
                     data = dataset.val_data
 
-                indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
+                if indices is None:
+                    indices = torch.randint(0, len(data), (args.batch_size,)).tolist()
                 batch_data = [data[i] for i in indices]
 
                 texts = [dataset.format_example(ex) for ex in batch_data]
@@ -1317,7 +1346,10 @@ def main():
                 return input_ids, attention_mask, labels_tensor
 
             # Create a batch for LR probing (will be resampled with different seeds)
-            probe_batch = list(get_batch('train'))  # [input_ids, attention_mask, labels]
+            # Generate effective_batch indices to keep RNG state consistent across batch_size/accum_steps configs
+            effective_batch = args.batch_size * args.accum_steps
+            _probe_indices = torch.randint(0, len(dataset.train_data), (effective_batch,)).tolist()
+            probe_batch = list(get_batch('train', indices=_probe_indices[:args.batch_size]))  # [input_ids, attention_mask, labels]
             label_token_ids_tensor = torch.tensor(dataset.label_token_ids, device='cuda')
 
             def _resample_probe_batch(seed):
@@ -1330,7 +1362,9 @@ def main():
                 """Compute classification loss and accuracy for a batch."""
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                 batch_size = input_ids.size(0)
-                seq_lengths = attention_mask.sum(dim=1) - 1
+                # With left padding, the last position is always the last real token
+                # (NOT attention_mask.sum()-1, which gives wrong index for left padding)
+                seq_lengths = input_ids.size(1) - 1
                 final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
                 label_logits = final_logits[:, label_token_ids_tensor].float()
                 loss = F.cross_entropy(label_logits, labels)
@@ -1355,10 +1389,19 @@ def main():
             batch_list = []  # List of (input_ids, attention_mask, labels) tuples
 
             def sample_new_batch(n_batches=1):
-                """Sample n_batches for the current iteration (for gradient accumulation)."""
+                """Sample n_batches for the current iteration (for gradient accumulation).
+
+                Generates all indices at once for effective_batch = batch_size * n_batches,
+                then splits into n_batches chunks. This ensures identical samples regardless
+                of how batch_size/accum_steps are configured for the same effective batch.
+                """
                 batch_list.clear()
-                for _ in range(n_batches):
-                    batch_list.append(get_batch('train'))
+                effective_batch = args.batch_size * n_batches
+                all_indices = torch.randint(0, len(dataset.train_data), (effective_batch,)).tolist()
+                for i in range(n_batches):
+                    start = i * args.batch_size
+                    end = start + args.batch_size
+                    batch_list.append(get_batch('train', indices=all_indices[start:end]))
 
             def loss_fn(batch_idx=0):
                 """Loss on batch at given index (for consistent +/- perturbation evaluation)."""
@@ -1461,7 +1504,8 @@ def main():
 
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                         batch_size = input_ids.size(0)
-                        seq_lengths = attention_mask.sum(dim=1) - 1
+                        # With left padding, the last position is always the last real token
+                        seq_lengths = input_ids.size(1) - 1
                         final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
 
                         label_token_ids = torch.tensor(dataset.label_token_ids, device='cuda')
@@ -1478,18 +1522,34 @@ def main():
     log("Warmup...")
     # Initialize batch for tasks (sample_new_batch was defined above for tasks)
     if args.task != 'static':
-        sample_new_batch()
+        sample_new_batch(args.accum_steps)
     for _ in range(3):
-        _ = loss_fn()
+        _ = loss_fn(0)
     if args.task != 'static':
-        sample_new_batch()
-    initial_loss = loss_fn()
-    log(f"Initial loss: {initial_loss:.4f}")
+        sample_new_batch(args.accum_steps)
+    # Compute initial loss over all accum_steps batches
+    initial_loss = 0.0
+    for batch_idx in range(args.accum_steps):
+        initial_loss += loss_fn(batch_idx)
+    initial_loss /= args.accum_steps
 
-    # Initial evaluation for tasks
+    # Get initial train accuracy if available
+    initial_train_acc = quick_train_acc() if quick_train_acc else None
+
+    # Log initial train metrics
+    if initial_train_acc is not None:
+        log(f"Initial train loss: {initial_loss:.4f}, train acc: {initial_train_acc*100:.1f}%")
+    else:
+        log(f"Initial train loss: {initial_loss:.4f}")
+
+    # Initial evaluation for tasks (val and test)
+    # These will be tracked and repeated in iteration output until next eval
+    last_val_acc = None
+    last_test_acc = None
     if evaluate_fn:
-        initial_acc = evaluate_fn('val')
-        log(f"Initial val accuracy: {initial_acc:.4f}")
+        last_val_acc = evaluate_fn('val')
+        last_test_acc = evaluate_fn('test')
+        log(f"Initial val acc: {last_val_acc*100:.1f}%, test acc: {last_test_acc*100:.1f}%")
 
     # Create trainer based on solver choice
     if args.solver == 'random':
@@ -1679,7 +1739,17 @@ def main():
                     acc_plateau_count = 0  # Reset counter after decay
                     best_acc_ema = acc_ema  # Reset best after decay
 
-        log(f"Iter {i:6d} | Loss: {loss:.4f}{acc_str} | Best: {best:.4f}{ema_str} | "
+        # Periodic evaluation for tasks (val AND test) - update last_val_acc, last_test_acc
+        if evaluate_fn and (i + 1) % args.eval_interval == 0:
+            last_val_acc = evaluate_fn('val')
+            last_test_acc = evaluate_fn('test')
+
+        # Build val/test string using last measured values
+        val_test_str = ""
+        if last_val_acc is not None:
+            val_test_str = f" | Val: {last_val_acc*100:.1f}% | Test: {last_test_acc*100:.1f}%"
+
+        log(f"Iter {i:6d} | Loss: {loss:.4f}{acc_str}{val_test_str} | Best: {best:.4f}{ema_str} | "
             f"Red: {initial_loss/loss:.2f}x | lr={lr:.0e} eps={epsilon:.0e} | {avg:.1f}s/it | ETA: {eta/3600:.1f}h")
 
         # W&B logging
@@ -1694,27 +1764,16 @@ def main():
             }
             if quick_train_acc is not None:
                 log_dict["train_acc"] = train_acc
+            if last_val_acc is not None:
+                log_dict["val_acc"] = last_val_acc
+                log_dict["test_acc"] = last_test_acc
             if args.search_strategy != 'none':
                 log_dict["loss_ema"] = loss_ema
             wandb_run.log(log_dict)
 
-        # Periodic evaluation for tasks (val AND test)
-        if evaluate_fn and (i + 1) % args.eval_interval == 0:
-            val_acc = evaluate_fn('val')
-            test_acc = evaluate_fn('test')
-            log(f"  >>> [Eval] Val: {val_acc:.4f} ({val_acc*100:.1f}%) | Test: {test_acc:.4f} ({test_acc*100:.1f}%)")
-
-            # W&B logging for eval
-            if wandb_run is not None:
-                wandb_run.log({
-                    "iteration": i,
-                    "val_acc": val_acc,
-                    "test_acc": test_acc,
-                })
-
             # Checkpoint on best test accuracy
-            if test_acc > best_test_acc:
-                best_test_acc = test_acc
+            if last_test_acc is not None and last_test_acc > best_test_acc:
+                best_test_acc = last_test_acc
                 import os
                 os.makedirs('checkpoints', exist_ok=True)
                 ckpt = {
@@ -1724,8 +1783,8 @@ def main():
                     'best': best,
                     'lr': trainer.lr if hasattr(trainer, 'lr') else lr,
                     'epsilon': trainer.epsilon if hasattr(trainer, 'epsilon') else epsilon,
-                    'val_acc': val_acc,
-                    'test_acc': test_acc,
+                    'val_acc': last_val_acc,
+                    'test_acc': last_test_acc,
                     'args': vars(args),
                 }
                 ckpt_path = f'checkpoints/best_{args.task}_np{args.n_perts}_bs{args.batch_size}.pt'

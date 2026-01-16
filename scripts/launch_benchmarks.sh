@@ -28,7 +28,7 @@ CHECKPOINT_INTERVAL=1000      # Save checkpoint every N iterations (set high to 
 SEARCH_STRATEGY="none"        # LR search: "none", "line", "local", "binary", "quadratic"
 LEARNING_RATE=1e-4            # Initial learning rate
 EPSILON=1e-4                  # Perturbation size (defaults to LR if not set)
-MEMORY_EFFICIENT=true         # Memory-efficient mode: regenerate RNG instead of caching gradients (required for OPT-13B+ on 40GB GPUs)
+MEMORY_EFFICIENT=true         # Regenerate RNG instead of caching gradients (required for 13B+ on 40GB)
 
 # Per-task sequence lengths (based on MeZO paper / typical input lengths)
 # MeZO uses max_length=2048 but most tasks don't need that much
@@ -41,18 +41,22 @@ SEQ_LENS[wic]=256             # Two sentences + word
 SEQ_LENS[squad]=512           # Context + question (can be long)
 
 # W&B configuration
-WANDB_ENABLED=true           # Set to true to enable W&B logging
+WANDB_ENABLED=false           # Set to true to enable W&B logging
 WANDB_PROJECT="spsa-mezo-benchmarks"
 
 # W&B API Key - SET THIS BEFORE RUNNING
 # You can also set it in your environment: export WANDB_API_KEY=your_key
-WANDB_API_KEY="d012aa6c401a897547b882790c033dccf658d9d5"
+WANDB_API_KEY=""
 
 # ==============================================================================
 # DO NOT EDIT BELOW THIS LINE (unless you know what you're doing)
 # ==============================================================================
 
-cd /home/romeo/1.5-SPSA-LLM
+# Get repo root (parent of scripts directory)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+cd "$REPO_ROOT"
 mkdir -p logs checkpoints
 
 # Map model name to HuggingFace model path
@@ -101,7 +105,7 @@ if [ "$WANDB_ENABLED" = true ]; then
     WANDB_ARGS="--wandb --wandb_project $WANDB_PROJECT"
 fi
 
-# Build memory-efficient argument
+# Build memory efficient argument
 MEM_EFF_ARG=""
 if [ "$MEMORY_EFFICIENT" = true ]; then
     MEM_EFF_ARG="--memory_efficient"
@@ -160,11 +164,11 @@ for GPU_ID in {0..5}; do
     echo "Launching $TASK on GPU $GPU_ID (screen: $SESSION_NAME, seq_len: $TASK_SEQ_LEN)"
 
     screen -dmS "$SESSION_NAME" bash -c "
-        cd /home/romeo/1.5-SPSA-LLM
+        cd $REPO_ROOT
 
         # Export W&B API key and Python path in screen session
         export WANDB_API_KEY='$WANDB_API_KEY'
-        export PYTHONPATH=/home/romeo/1.5-SPSA-LLM
+        export PYTHONPATH=$REPO_ROOT
 
         echo '=============================================='
         echo 'Starting $TASK training on GPU $GPU_ID'
