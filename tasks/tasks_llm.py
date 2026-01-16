@@ -90,11 +90,12 @@ TASK_CONFIG = {
     "squad": {
         "dataset_name": "squad",
         "dataset_config": None,
-        "text_columns": ["context", "question"],
+        "text_columns": ["title", "context", "question"],
         "label_column": "answers",  # Special handling for SQuAD answers
         "num_labels": None,  # Generative task
         "label_names": None,  # Generative task
-        "prompt_template": "Context: {context}\n\nQuestion: {question}\n\nAnswer:",
+        # MeZO-style prompt format
+        "prompt_template": "Title: {title}\nContext: {context}\nQuestion: {question}\nAnswer:",
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
@@ -319,8 +320,9 @@ class LLMTaskDataset:
             # Generative task (e.g., SQuAD)
             answers = [self.get_answer(ex) for ex in batch_examples]
 
-            # For training, we concatenate prompt + answer and use LM loss
-            texts_with_answers = [f"{t} {a}" for t, a in zip(texts, answers)]
+            # For training, we concatenate prompt + answer + newline
+            # The newline teaches the model to STOP after giving the answer
+            texts_with_answers = [f"{t} {a}\n" for t, a in zip(texts, answers)]
 
             # Tokenize prompt only (for generation evaluation)
             prompt_encodings = self.tokenizer(
