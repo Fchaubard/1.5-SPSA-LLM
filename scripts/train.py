@@ -1259,11 +1259,25 @@ def main():
                 batch_size, seq_len_minus_1 = shift_labels.shape
 
                 # Create mask for answer tokens only
+                # With left padding, we need to find the actual positions of tokens
                 answer_mask = torch.zeros(batch_size, seq_len_minus_1, device='cuda')
                 for i, prompt_len in enumerate(prompt_lengths):
-                    start_pos = max(0, prompt_len - 1)
-                    end_pos = int(attention_mask[i].sum().item()) - 1
-                    if start_pos < end_pos:
+                    # Find where actual content starts (first 1 in attention_mask)
+                    # With left padding: [0,0,0,...,1,1,1] so nonzero()[0] gives start
+                    nonzero_positions = attention_mask[i].nonzero(as_tuple=True)[0]
+                    if len(nonzero_positions) == 0:
+                        continue
+                    content_start = nonzero_positions[0].item()
+                    content_end = nonzero_positions[-1].item()
+
+                    # prompt_len is the number of prompt tokens (not including answer)
+                    # The answer starts at position: content_start + prompt_len
+                    # In the shifted labels (for next-token prediction), answer tokens
+                    # are at positions: content_start + prompt_len - 1 to content_end - 1
+                    start_pos = content_start + prompt_len - 1
+                    end_pos = content_end  # content_end is the last real token position
+
+                    if start_pos < end_pos and start_pos >= 0 and end_pos <= seq_len_minus_1:
                         answer_mask[i, start_pos:end_pos] = 1.0
 
                 # Compute loss

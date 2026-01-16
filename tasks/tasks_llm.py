@@ -411,18 +411,16 @@ def compute_llm_classification_loss(
     batch_size = logits.size(0)
     device = logits.device
 
-    # Find the last non-padding position for each example
-    if attention_mask is not None:
-        # Sum attention mask to get length, then subtract 1 for index
-        seq_lengths = attention_mask.sum(dim=1) - 1
-        seq_lengths = seq_lengths.clamp(min=0)
-    else:
-        # Assume no padding - use last position
-        seq_lengths = torch.full((batch_size,), logits.size(1) - 1, device=device)
+    # With LEFT padding (standard for decoder-only models like OPT),
+    # the last real token is always at position seq_len - 1.
+    # The attention_mask.sum() approach is WRONG for left padding because
+    # it gives the COUNT of real tokens, not their position.
+    # Example: max_len=512, actual_len=200 -> last token at position 511, not 199!
+    last_position = logits.size(1) - 1
 
     # Extract logits at the last position for each example
     # Shape: [batch_size, vocab_size]
-    last_logits = logits[torch.arange(batch_size, device=device), seq_lengths.long()]
+    last_logits = logits[:, last_position, :]
 
     # Extract only the logits for our label tokens
     # Shape: [batch_size, num_labels]
@@ -459,15 +457,14 @@ def compute_llm_classification_accuracy(
     batch_size = logits.size(0)
     device = logits.device
 
-    # Find the last non-padding position
-    if attention_mask is not None:
-        seq_lengths = attention_mask.sum(dim=1) - 1
-        seq_lengths = seq_lengths.clamp(min=0)
-    else:
-        seq_lengths = torch.full((batch_size,), logits.size(1) - 1, device=device)
+    # With LEFT padding (standard for decoder-only models like OPT),
+    # the last real token is always at position seq_len - 1.
+    # The attention_mask.sum() approach is WRONG for left padding because
+    # it gives the COUNT of real tokens, not their position.
+    last_position = logits.size(1) - 1
 
     # Extract logits at the last position
-    last_logits = logits[torch.arange(batch_size, device=device), seq_lengths.long()]
+    last_logits = logits[:, last_position, :]
 
     # Extract only the logits for our label tokens
     label_token_ids_tensor = torch.tensor(label_token_ids, device=device, dtype=torch.long)
@@ -555,13 +552,25 @@ def compute_generative_loss(
     shift_labels = input_ids[:, 1:].contiguous()
 
     # Create mask for answer tokens only (after prompt)
+    # With left padding, we need to find the actual positions of tokens
     answer_mask = torch.zeros(batch_size, seq_len - 1, device=device)
     for i, prompt_len in enumerate(prompt_lengths):
-        # Answer tokens start at position prompt_len (0-indexed)
-        # After shift, we want positions from prompt_len-1 onwards
-        start_pos = max(0, prompt_len - 1)
-        end_pos = attention_mask[i].sum().item() - 1  # Last non-padding position
-        if start_pos < end_pos:
+        # Find where actual content starts (first 1 in attention_mask)
+        # With left padding: [0,0,0,...,1,1,1] so nonzero()[0] gives start
+        nonzero_positions = attention_mask[i].nonzero(as_tuple=True)[0]
+        if len(nonzero_positions) == 0:
+            continue
+        content_start = nonzero_positions[0].item()
+        content_end = nonzero_positions[-1].item()
+
+        # prompt_len is the number of prompt tokens (not including answer)
+        # The answer starts at position: content_start + prompt_len
+        # In the shifted labels (for next-token prediction), answer tokens
+        # are at positions: content_start + prompt_len - 1 to content_end - 1
+        start_pos = content_start + prompt_len - 1
+        end_pos = content_end  # content_end is the last real token position
+
+        if start_pos < end_pos and start_pos >= 0 and end_pos <= seq_len - 1:
             answer_mask[i, start_pos:end_pos] = 1.0
 
     # Compute cross-entropy loss
