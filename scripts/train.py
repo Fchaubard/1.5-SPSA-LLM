@@ -53,7 +53,7 @@ class SPSATrainer:
     def __init__(self, model, lr=1e-4, epsilon=1e-4, n_perts=40,
                  use_curvature=False, saturating_alpha=0.1, lambda_reg=1.0,
                  memory_efficient=False,
-                 accum_steps=1):
+                 accum_steps=1, weight_decay=0.0):
         self.lr = lr
         self.epsilon = epsilon
         self.n_perts = n_perts
@@ -62,6 +62,7 @@ class SPSATrainer:
         self.lambda_reg = lambda_reg
         self.memory_efficient = memory_efficient
         self.accum_steps = accum_steps
+        self.weight_decay = weight_decay
 
         self.params = [p for p in model.parameters() if p.requires_grad]
         self.total = sum(p.numel() for p in self.params)
@@ -504,6 +505,11 @@ class SPSATrainer:
         for info, grad in zip(self.param_info, self.grads):
             info['param'].data.view(-1).sub_(grad, alpha=self.lr)
 
+        # Apply weight decay
+        if self.weight_decay > 0:
+            for info in self.param_info:
+                info['param'].data.mul_(1 - self.lr * self.weight_decay)
+
         return total_loss / self.n_perts
 
     def _step_memory_efficient(self, loss_fn, iteration):
@@ -573,6 +579,11 @@ class SPSATrainer:
                     info['numel'], -self.lr * grad_coeff, BLOCK_SIZE=1024)
 
             del packed
+
+        # Apply weight decay
+        if self.weight_decay > 0:
+            for info in self.param_info:
+                info['param'].data.mul_(1 - self.lr * self.weight_decay)
 
         return total_loss / self.n_perts
 
@@ -1063,6 +1074,7 @@ def main():
     parser.add_argument('--lr_decay_patience', type=int, default=50, help='Decay LR if train acc plateaus for this many iters')
     parser.add_argument('--lr_decay_factor', type=float, default=0.5, help='Factor to multiply LR by on plateau')
     parser.add_argument('--lr_min_decay', type=float, default=1e-7, help='Minimum LR after decay')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay (L2 regularization)')
 
     args = parser.parse_args()
 
@@ -1146,6 +1158,8 @@ def main():
         log(f"  lr_decay_patience: {args.lr_decay_patience} (decay if train acc plateaus)")
         log(f"  lr_decay_factor: {args.lr_decay_factor}")
         log(f"  lr_min_decay: {args.lr_min_decay}")
+    if args.weight_decay > 0:
+        log(f"  weight_decay: {args.weight_decay}")
 
     log("Loading model...")
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1443,6 +1457,9 @@ def main():
 
             def evaluate_fn(split='val'):
                 """Evaluate F1 score on a dataset split for generative task."""
+                # Clear cache before eval - generate() uses KV cache which needs extra memory
+                torch.cuda.empty_cache()
+
                 if split == 'val':
                     data = dataset.val_data
                 else:
@@ -1451,9 +1468,12 @@ def main():
                 total_f1 = 0.0
                 total_samples = 0
 
+                # Use smaller batch for generation (KV cache uses more memory than forward pass)
+                eval_batch_size = max(1, args.batch_size // 2)
+
                 with torch.no_grad():
-                    for start_idx in range(0, len(data), args.batch_size):
-                        end_idx = min(start_idx + args.batch_size, len(data))
+                    for start_idx in range(0, len(data), eval_batch_size):
+                        end_idx = min(start_idx + eval_batch_size, len(data))
                         batch_data = data[start_idx:end_idx]
 
                         texts = [dataset.format_example(ex) for ex in batch_data]
@@ -1466,7 +1486,8 @@ def main():
                         input_ids = encodings["input_ids"].to('cuda')
                         attention_mask = encodings["attention_mask"].to('cuda')
 
-                        # Generate predictions
+                        # Generate predictions (stop at newline since we train with newline after answer)
+                        newline_token_id = tokenizer.encode('\n', add_special_tokens=False)[0]
                         outputs = model.generate(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
@@ -1474,6 +1495,7 @@ def main():
                             num_beams=1,
                             do_sample=False,
                             pad_token_id=tokenizer.pad_token_id,
+                            eos_token_id=[tokenizer.eos_token_id, newline_token_id],
                         )
 
                         # Decode predictions (only new tokens)
@@ -1481,17 +1503,24 @@ def main():
                             prompt_len = input_ids[i].shape[0]
                             pred_tokens = output[prompt_len:]
                             pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                            # Take only first line in case newline stopping didn't work
+                            pred_text = pred_text.split('\n')[0].strip()
 
                             # Compute F1
                             f1 = compute_squad_f1(pred_text, gold)
                             total_f1 += f1
                             total_samples += 1
 
+                # Clear cache after eval to free KV cache memory before returning to training
+                torch.cuda.empty_cache()
                 return total_f1 / total_samples if total_samples > 0 else 0.0
         else:
             # Classification evaluation
             def evaluate_fn(split='val'):
                 """Evaluate accuracy on a dataset split."""
+                # Clear cache before eval
+                torch.cuda.empty_cache()
+
                 if split == 'val':
                     data = dataset.val_data
                 else:
@@ -1529,6 +1558,8 @@ def main():
                         total_correct += (predictions == labels_tensor).sum().item()
                         total_samples += len(batch_data)
 
+                # Clear cache after eval before returning to training
+                torch.cuda.empty_cache()
                 return total_correct / total_samples if total_samples > 0 else 0.0
 
         log(f"Dataset loaded: train={len(dataset.train_data)}, val={len(dataset.val_data)}")
@@ -1578,7 +1609,8 @@ def main():
                               saturating_alpha=args.saturating_alpha,
                               lambda_reg=args.lambda_reg,
                               memory_efficient=args.memory_efficient,
-                              accum_steps=args.accum_steps)
+                              accum_steps=args.accum_steps,
+                              weight_decay=args.weight_decay)
 
     # Parse explicit LR points if provided
     explicit_lrs = None
