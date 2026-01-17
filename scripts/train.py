@@ -1230,8 +1230,9 @@ def main():
                 texts = [dataset.format_example(ex) for ex in batch_data]
                 answers = [dataset.get_answer(ex) for ex in batch_data]
 
-                # Concatenate prompt + answer for training
-                texts_with_answers = [f"{t} {a}" for t, a in zip(texts, answers)]
+                # Concatenate prompt + answer + newline for training
+                # The newline teaches the model to STOP after giving the answer
+                texts_with_answers = [f"{t} {a}\n" for t, a in zip(texts, answers)]
 
                 # Get prompt lengths for loss masking
                 prompt_encodings = tokenizer(
