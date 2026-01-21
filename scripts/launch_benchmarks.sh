@@ -3,6 +3,7 @@
 # Launch MeZO Benchmark Training Jobs
 # Runs all 6 benchmarks (SST-2, RTE, BoolQ, WSC, WiC, SQuAD) on GPUs 0-5
 # ==============================================================================
+screen -ls | grep '\.' | awk '{print $1}' | xargs -I{} screen -S {} -X quit 2>/dev/null
 
 # ==============================================================================
 # CONFIGURATION - Edit these variables before running
@@ -14,31 +15,47 @@ SOLVER="1.5SPSA"
 
 # Model configuration
 # Options: "OPT125M" (for testing), "OPT13B", "OPT30B", "OPT66B"
-MODEL="OPT13B"
+MODEL="OPT30B"
 
 # Training hyperparameters
 N_PERTS=40                    # Number of perturbations per iteration
-MICROBATCH_SIZE=16            # Batch size per forward pass
-ACCUM_STEPS=1                 # Gradient accumulation steps (mainly for backprop)
+MICROBATCH_SIZE=32            # Batch size per forward pass (default for most tasks)
+ACCUM_STEPS=16                # Gradient accumulation steps (effective batch = 32*16 = 512)
+
+# Per-task batch sizes
+# Note: accum_steps only works for backprop, not SPSA
+# For SPSA, batch_size IS the effective batch size per perturbation
+# Shorter sequences allow larger batches
+declare -A TASK_BATCH
+TASK_BATCH[sst2]=32           # seq=128, short sentences
+TASK_BATCH[rte]=32            # seq=256
+TASK_BATCH[boolq]=32          # seq=512, longer passages
+TASK_BATCH[wsc]=32            # seq=128, short sentences
+TASK_BATCH[wic]=32            # seq=256
+TASK_BATCH[squad]=28          # seq=512, reduced for generation OOM
 SATURATING_ALPHA=0.1          # Exponent for 1.5-SPSA curvature scaling
 LAMBDA_REG=1.0                # Minimum curvature regularization
 N_ITERATIONS=1000000          # Total training iterations (1M)
-EVAL_INTERVAL=100             # Evaluate every N iterations
-CHECKPOINT_INTERVAL=1000      # Save checkpoint every N iterations (set high to save storage)
+EVAL_INTERVAL=10              # Evaluate every N iterations
+CHECKPOINT_INTERVAL=100       # Save checkpoint every N iterations
 SEARCH_STRATEGY="none"        # LR search: "none", "line", "local", "binary", "quadratic"
 LEARNING_RATE=1e-4            # Initial learning rate
 EPSILON=1e-4                  # Perturbation size (defaults to LR if not set)
-MEMORY_EFFICIENT=true         # Regenerate RNG instead of caching gradients (required for 13B+ on 40GB)
+WEIGHT_DECAY=0.001            # Weight decay (L2 regularization)
+MEMORY_EFFICIENT=true         # Memory-efficient mode: regenerate RNG instead of caching gradients (required for OPT-13B+ on 40GB GPUs)
 
 # Per-task sequence lengths (based on MeZO paper / typical input lengths)
 # MeZO uses max_length=2048 but most tasks don't need that much
 declare -A SEQ_LENS
-SEQ_LENS[sst2]=128            # Short sentences
+SEQ_LENS[sst2]=256            # Short sentences
 SEQ_LENS[rte]=256             # Sentence pairs
 SEQ_LENS[boolq]=512           # Passage + question
-SEQ_LENS[wsc]=128             # Short sentences
+SEQ_LENS[wsc]=256             # Short sentences
 SEQ_LENS[wic]=256             # Two sentences + word
 SEQ_LENS[squad]=512           # Context + question (can be long)
+
+# Timestamp for unique log names (NEVER overwrite logs!)
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # W&B configuration
 WANDB_ENABLED=false           # Set to true to enable W&B logging
@@ -52,11 +69,7 @@ WANDB_API_KEY=""
 # DO NOT EDIT BELOW THIS LINE (unless you know what you're doing)
 # ==============================================================================
 
-# Get repo root (parent of scripts directory)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-
-cd "$REPO_ROOT"
+cd /home/ec2-user/functor/garbage/zoo/1.5-SPSA-LLM
 mkdir -p logs checkpoints
 
 # Map model name to HuggingFace model path
@@ -159,33 +172,43 @@ echo "=============================================="
 for GPU_ID in {0..5}; do
     TASK=${BENCHMARKS[$GPU_ID]}
     TASK_SEQ_LEN=${SEQ_LENS[$TASK]}
-    SESSION_NAME="${SOLVER}_${TASK}_${MODEL}_np${N_PERTS}_bs${MICROBATCH_SIZE}"
+    TASK_BS=${TASK_BATCH[$TASK]}
+    SESSION_NAME="${SOLVER}_${TASK}_${MODEL}_np${N_PERTS}_bs${TASK_BS}"
 
-    echo "Launching $TASK on GPU $GPU_ID (screen: $SESSION_NAME, seq_len: $TASK_SEQ_LEN)"
+    echo "Launching $TASK on GPU $GPU_ID (screen: $SESSION_NAME, seq_len: $TASK_SEQ_LEN, batch: ${TASK_BS})"
 
     screen -dmS "$SESSION_NAME" bash -c "
-        cd $REPO_ROOT
+        cd /home/ec2-user/functor/garbage/zoo/1.5-SPSA-LLM
 
         # Export W&B API key and Python path in screen session
         export WANDB_API_KEY='$WANDB_API_KEY'
-        export PYTHONPATH=$REPO_ROOT
+        export PYTHONPATH=/mnt/data/python_packages:/home/ec2-user/functor/garbage/zoo/1.5-SPSA-LLM
+        export HF_HOME=/mnt/data/huggingface
+        export HF_DATASETS_CACHE=/mnt/data/huggingface/datasets
+        export TRANSFORMERS_CACHE=/mnt/data/huggingface/transformers
+        export TMPDIR=/mnt/data/tmp
+        export TRITON_CACHE_DIR=/mnt/data/triton_cache
+        mkdir -p /mnt/data/tmp /mnt/data/triton_cache
 
         echo '=============================================='
         echo 'Starting $TASK training on GPU $GPU_ID'
         echo 'Solver: $SOLVER | Model: $MODEL'
         echo 'Seq Length: $TASK_SEQ_LEN'
+        echo 'Batch Size: $TASK_BS'
         echo 'Screen session: $SESSION_NAME'
         echo '=============================================='
 
-        CUDA_VISIBLE_DEVICES=$GPU_ID python scripts/train.py \\
+        CUDA_VISIBLE_DEVICES=$GPU_ID /usr/bin/python3.9 scripts/train.py \\
             --task $TASK \\
             --model $MODEL_PATH \\
             $SOLVER_ARGS \\
             --n_perts $N_PERTS \\
-            --batch_size $MICROBATCH_SIZE \\
+            --batch_size $TASK_BS \\
+            --accum_steps $ACCUM_STEPS \\
             --n_iterations $N_ITERATIONS \\
             --lr $LEARNING_RATE \\
             --epsilon $EPSILON \\
+            --weight_decay $WEIGHT_DECAY \\
             --seq_len $TASK_SEQ_LEN \\
             --eval_interval $EVAL_INTERVAL \\
             --checkpoint_interval $CHECKPOINT_INTERVAL \\
@@ -193,7 +216,7 @@ for GPU_ID in {0..5}; do
             $MEM_EFF_ARG \\
             $WANDB_ARGS \\
             --wandb_run_name '${SOLVER}_${TASK}_${MODEL}' \\
-            2>&1 | tee logs/benchmark_${SOLVER}_${TASK}_${MODEL}.log
+            2>&1 | tee logs/benchmark_${SOLVER}_${TASK}_${MODEL}_${TIMESTAMP}.log
 
         echo ''
         echo '=============================================='
@@ -215,6 +238,7 @@ echo ""
 echo "Session names:"
 for GPU_ID in {0..5}; do
     TASK=${BENCHMARKS[$GPU_ID]}
-    echo "  GPU $GPU_ID: ${SOLVER}_${TASK}_${MODEL}_np${N_PERTS}_bs${MICROBATCH_SIZE}"
+    TASK_BS=${TASK_BATCH[$TASK]}
+    echo "  GPU $GPU_ID: ${SOLVER}_${TASK}_${MODEL}_np${N_PERTS}_bs${TASK_BS}"
 done
 echo ""

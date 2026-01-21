@@ -55,4 +55,5 @@ data_cache/
 Thumbs.db
 
 # Claude
+CLAUDE.md
 CLAUDE_RULES.md
