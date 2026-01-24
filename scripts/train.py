@@ -874,6 +874,11 @@ class MeZOTrainer:
         # Want: theta - lr * g * z where g = (loss_plus - loss_minus) / (2*epsilon)
         # So we need to apply: +epsilon*z - lr*g*z = (epsilon - lr*g)*z
         grad = (loss_plus - loss_minus) / (2 * self.epsilon)
+
+        # Clip gradient to prevent explosion (MeZO uses single perturbation so can be noisy)
+        max_grad = 10.0  # Reasonable upper bound
+        grad = max(-max_grad, min(max_grad, grad))
+
         update_scale = self.epsilon - self.lr * grad
 
         for info in self.param_info:
