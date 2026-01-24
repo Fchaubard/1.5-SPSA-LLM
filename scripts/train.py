@@ -592,6 +592,87 @@ class SPSATrainer:
 
         return total_loss / self.n_perts
 
+    def step_parallel_rl(self, evaluator, iteration, rollouts_per_pert=10):
+        """
+        SPSA step with parallel RL evaluation.
+
+        Uses multiprocessing to evaluate perturbations in parallel across workers.
+        Each worker evaluates (f_clean, f_plus, f_minus) for assigned perturbations.
+
+        Args:
+            evaluator: ParallelAtariEvaluator instance
+            iteration: Current iteration number (for seed generation)
+            rollouts_per_pert: K environment seeds per perturbation
+
+        Returns:
+            Mean negative reward (loss) for logging
+        """
+        from tasks.tasks_atari import generate_env_seeds, generate_pert_seed
+        import numpy as np
+
+        # Generate perturbation assignments
+        pert_assignments = []
+        for pert_idx in range(self.n_perts):
+            pert_seed = generate_pert_seed(iteration, pert_idx)
+            env_seeds = generate_env_seeds(iteration, pert_idx, rollouts_per_pert)
+            pert_assignments.append((pert_idx, pert_seed, env_seeds))
+
+        # Get base weights and transfer to CPU for workers
+        base_weights = {k: v.cpu() for k, v in self.model.state_dict().items()}
+
+        # Evaluate all perturbations in parallel
+        results = evaluator.evaluate_perturbations(
+            base_weights, pert_assignments, self.epsilon, self.packed_size
+        )
+
+        # Aggregate gradients (regenerate perturbations on GPU, don't cache)
+        total_reward = 0.0
+        for pert_idx, (f_clean, f_plus, f_minus) in enumerate(results):
+            # Regenerate the same perturbation using the same seed
+            pert_seed = generate_pert_seed(iteration, pert_idx)
+            torch.manual_seed(pert_seed)
+            packed = torch.randint(0, 256, (self.packed_size,), device='cuda', dtype=torch.uint8)
+
+            # Compute gradient coefficient (using reward, so we want to maximize)
+            # For RL, we want to MAXIMIZE reward, so gradient direction is reversed
+            # Standard SPSA minimizes: grad = (f_plus - f_minus) / (2*eps)
+            # For RL maximization: grad = -(f_plus - f_minus) / (2*eps) = (f_minus - f_plus) / (2*eps)
+            # But we update: weights -= lr * grad, so for maximization we want:
+            # weights += lr * (f_plus - f_minus) / (2*eps) * delta
+            # Which is: weights -= lr * (f_minus - f_plus) / (2*eps) * delta
+
+            if self.use_curvature:
+                # 1.5-SPSA: use curvature to scale gradient
+                curv = abs(f_plus - 2*f_clean + f_minus) / (self.epsilon ** 2)
+                curvature = max(curv ** self.saturating_alpha, self.lambda_reg)
+                # For reward maximization, flip the sign
+                grad_coeff = (f_minus - f_plus) / (2 * self.epsilon * self.n_perts * curvature)
+            else:
+                # Standard SPSA - flip sign for reward maximization
+                grad_coeff = (f_minus - f_plus) / (2 * self.epsilon * self.n_perts)
+
+            # Apply gradient contribution using Triton kernel (in-place update)
+            for info in self.param_info:
+                _unpack_and_apply[info['grid']](
+                    info['param'].data.view(-1),
+                    packed[info['packed_offset']:],
+                    info['numel'],
+                    -self.lr * grad_coeff,  # Apply update
+                    BLOCK_SIZE=1024
+                )
+
+            total_reward += f_clean
+            del packed  # Don't cache
+
+        # Apply weight decay
+        if self.weight_decay > 0:
+            for info in self.param_info:
+                info['param'].data.mul_(1 - self.lr * self.weight_decay)
+
+        # Return mean negative reward as "loss" for logging compatibility
+        mean_reward = total_reward / self.n_perts
+        return -mean_reward  # Negative because loss should decrease as reward increases
+
 
 class RandomSearchTrainer:
     """
@@ -1032,6 +1113,176 @@ class BackpropTrainer:
         return self.lr, False
 
 
+def run_atari_training(args, lr, epsilon, n_perts, n_iterations, wandb_run, run_id):
+    """
+    Run Atari Breakout training with CNN policy and 1.5-SPSA.
+
+    This is a separate function because Atari uses:
+    - AtariCNN model instead of LLM
+    - Multiprocessing for parallel rollout collection
+    - Different training loop (step_parallel_rl)
+    """
+    import numpy as np
+
+    log("=" * 70)
+    log("ATARI BREAKOUT TRAINING")
+    log("=" * 70)
+
+    # Load CNN model
+    log("Loading AtariCNN model...")
+    from models.atari_cnn import AtariCNN
+    model = AtariCNN(num_actions=4).to('cuda')
+    model.eval()  # Disable dropout
+    for p in model.parameters():
+        p.requires_grad = True
+    log(f"Loaded: {model.count_parameters()/1e6:.2f}M params")
+
+    # Create parallel evaluator
+    log(f"Creating parallel evaluator with {args.num_workers} workers...")
+    from tasks.tasks_atari import ParallelAtariEvaluator, evaluate_policy
+    evaluator = ParallelAtariEvaluator(
+        num_workers=args.num_workers,
+        num_actions=4
+    )
+    log("Evaluator ready")
+
+    # Create SPSA trainer
+    # Note: For Atari we always use memory_efficient=True since we use step_parallel_rl
+    trainer = SPSATrainer(
+        model=model,
+        lr=lr,
+        epsilon=epsilon,
+        n_perts=n_perts,
+        use_curvature=args.use_1_5_spsa,
+        saturating_alpha=args.saturating_alpha,
+        lambda_reg=args.lambda_reg,
+        memory_efficient=True,  # Always memory efficient for Atari
+        weight_decay=args.weight_decay
+    )
+    # Store model reference for step_parallel_rl
+    trainer.model = model
+
+    # Initial evaluation
+    log("Initial evaluation...")
+    initial_reward = evaluate_policy(model, n_episodes=10, device='cuda')
+    log(f"Initial reward: {initial_reward:.1f}")
+
+    log("=" * 70)
+    log("TRAINING")
+    log("=" * 70)
+
+    losses = [-initial_reward]  # Negative reward as loss
+    best_reward = initial_reward
+    best_loss = -initial_reward
+    t0 = time.time()
+    last_t = t0
+    last_i = 0
+
+    # Track last evaluation result
+    last_eval_reward = initial_reward
+
+    for i in range(n_iterations):
+        # Perform SPSA step with parallel RL evaluation
+        loss = trainer.step_parallel_rl(
+            evaluator=evaluator,
+            iteration=i,
+            rollouts_per_pert=args.rollouts_per_pert
+        )
+        losses.append(loss)
+
+        if loss < best_loss:
+            best_loss = loss
+
+        # Periodic evaluation (more rollouts, fixed seeds)
+        if (i + 1) % args.eval_interval == 0:
+            eval_reward = evaluate_policy(model, n_episodes=20, device='cuda')
+            last_eval_reward = eval_reward
+
+            if eval_reward > best_reward:
+                best_reward = eval_reward
+
+                # Save best checkpoint
+                import os
+                os.makedirs('checkpoints', exist_ok=True)
+                ckpt = {
+                    'iteration': i + 1,
+                    'model_state_dict': {k: v.cpu().clone() for k, v in model.state_dict().items()},
+                    'best_reward': best_reward,
+                    'lr': trainer.lr,
+                    'epsilon': trainer.epsilon,
+                    'args': vars(args),
+                }
+                ckpt_path = f'checkpoints/best_atari_{run_id}.pt'
+                torch.save(ckpt, ckpt_path)
+                log(f"  >>> NEW BEST! Reward={eval_reward:.1f}, saved to {ckpt_path}")
+
+        # Logging
+        now = time.time()
+        dt = now - last_t
+        di = i - last_i if i > 0 else 1
+        avg = dt / di if di > 0 else 0
+        eta = (now - t0) / (i + 1) * (n_iterations - i - 1) if i > 0 else 0
+
+        # loss is negative reward, so -loss is reward for current step
+        current_reward = -loss
+        log(f"Iter {i:6d} | Reward: {current_reward:.1f} | Eval: {last_eval_reward:.1f} | "
+            f"Best: {best_reward:.1f} | lr={lr:.0e} eps={epsilon:.0e} | "
+            f"{avg:.1f}s/it | ETA: {eta/3600:.1f}h")
+
+        # W&B logging
+        if wandb_run is not None:
+            log_dict = {
+                "iteration": i,
+                "reward": current_reward,
+                "eval_reward": last_eval_reward,
+                "best_reward": best_reward,
+                "loss": loss,
+                "lr": lr,
+                "epsilon": epsilon,
+            }
+            wandb_run.log(log_dict)
+
+        last_t = now
+        last_i = i
+
+        # Periodic checkpoint
+        if (i + 1) % args.checkpoint_interval == 0:
+            import os
+            os.makedirs('checkpoints', exist_ok=True)
+            ckpt = {
+                'iteration': i + 1,
+                'model_state_dict': {k: v.cpu().clone() for k, v in model.state_dict().items()},
+                'losses': losses,
+                'best_reward': best_reward,
+                'lr': trainer.lr,
+                'epsilon': trainer.epsilon,
+            }
+            ckpt_path = f'checkpoints/ckpt_atari_{run_id}_{i+1}.pt'
+            try:
+                torch.save(ckpt, ckpt_path)
+                log(f"  >>> Checkpoint saved: {ckpt_path}")
+            except Exception as e:
+                log(f"  >>> Checkpoint save failed: {e}")
+
+    # Final evaluation
+    log("=" * 70)
+    log("FINAL EVALUATION")
+    log("=" * 70)
+    final_reward = evaluate_policy(model, n_episodes=50, device='cuda')
+    log(f"Final reward (50 episodes): {final_reward:.1f}")
+    log(f"Best reward during training: {best_reward:.1f}")
+
+    # W&B summary
+    if wandb_run is not None:
+        wandb_run.summary["final_reward"] = final_reward
+        wandb_run.summary["best_reward"] = best_reward
+        wandb_run.finish()
+
+    # Cleanup
+    evaluator.close()
+    log("Training complete!")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train LLM with SPSA/RandomSearch - Adaptive LR Search')
     parser.add_argument('--model', type=str, default='facebook/opt-13b',
@@ -1040,8 +1291,8 @@ def main():
                         choices=['spsa', 'random', 'mezo', 'backprop'],
                         help='Solver: spsa (1-SPSA), mezo (MeZO baseline), random (greedy random search), or backprop')
     parser.add_argument('--task', type=str, default='static',
-                        choices=['static', 'sst2', 'rte', 'boolq', 'wsc', 'wic', 'squad', 'toolbench'],
-                        help='Task: static (overfit random batch), classification task, squad (generative), or toolbench (API classification)')
+                        choices=['static', 'sst2', 'rte', 'boolq', 'wsc', 'wic', 'squad', 'toolbench', 'atari_breakout'],
+                        help='Task: static (overfit random batch), classification task, squad (generative), toolbench (API classification), or atari_breakout (RL)')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='spsa-llm', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (auto-generated if not set)')
@@ -1081,6 +1332,16 @@ def main():
     parser.add_argument('--lr_decay_factor', type=float, default=0.5, help='Factor to multiply LR by on plateau')
     parser.add_argument('--lr_min_decay', type=float, default=1e-7, help='Minimum LR after decay')
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay (L2 regularization)')
+
+    # Atari-specific arguments
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of parallel workers for Atari rollout collection')
+    parser.add_argument('--rollouts_per_pert', type=int, default=10,
+                        help='K: number of rollouts per perturbation (same seeds for clean/+/-)')
+    parser.add_argument('--max_episode_steps', type=int, default=10000,
+                        help='Max steps per Atari episode')
+    parser.add_argument('--frame_stack', type=int, default=4,
+                        help='Number of frames to stack for Atari')
 
     args = parser.parse_args()
 
@@ -1169,6 +1430,15 @@ def main():
         log(f"  lr_min_decay: {args.lr_min_decay}")
     if args.weight_decay > 0:
         log(f"  weight_decay: {args.weight_decay}")
+    if args.task == 'atari_breakout':
+        log(f"  num_workers: {args.num_workers}")
+        log(f"  rollouts_per_pert: {args.rollouts_per_pert}")
+        log(f"  max_episode_steps: {args.max_episode_steps}")
+
+    # Handle Atari task separately (uses CNN model, not LLM)
+    if args.task == 'atari_breakout':
+        run_atari_training(args, lr, epsilon, n_perts, n_iterations, wandb_run, run_id)
+        return
 
     log("Loading model...")
     from transformers import AutoModelForCausalLM, AutoTokenizer

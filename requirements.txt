@@ -4,3 +4,8 @@ triton>=2.0.0
 datasets>=2.0.0
 numpy
 accelerate
+
+# Atari RL dependencies
+gymnasium[atari]>=0.29.0
+ale-py>=0.8.1
+opencv-python>=4.8.0
