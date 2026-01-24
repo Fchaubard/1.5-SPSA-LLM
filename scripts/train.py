@@ -7,6 +7,11 @@ Implements two search strategies:
 2. Quadratic fit: Use quadratic interpolation to find optimal point
 """
 
+import sys
+import os
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import torch
 import triton
@@ -1029,13 +1034,14 @@ class BackpropTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description='Train LLM with SPSA/RandomSearch - Adaptive LR Search')
-    parser.add_argument('--model', type=str, default='facebook/opt-13b', help='Model name or path')
+    parser.add_argument('--model', type=str, default='facebook/opt-13b',
+                        help='Model name or path (e.g., facebook/opt-13b, Qwen/Qwen3-1.7B, Qwen/Qwen3-8B)')
     parser.add_argument('--solver', type=str, default='spsa',
                         choices=['spsa', 'random', 'mezo', 'backprop'],
                         help='Solver: spsa (1-SPSA), mezo (MeZO baseline), random (greedy random search), or backprop')
     parser.add_argument('--task', type=str, default='static',
-                        choices=['static', 'sst2', 'rte', 'boolq', 'wsc', 'wic', 'squad'],
-                        help='Task: static (overfit random batch), classification task, or squad (generative)')
+                        choices=['static', 'sst2', 'rte', 'boolq', 'wsc', 'wic', 'squad', 'toolbench'],
+                        help='Task: static (overfit random batch), classification task, squad (generative), or toolbench (API classification)')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='spsa-llm', help='W&B project name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (auto-generated if not set)')
@@ -1077,6 +1083,9 @@ def main():
     parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay (L2 regularization)')
 
     args = parser.parse_args()
+
+    # Generate unique run_id based on timestamp
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Set random seeds for reproducibility
     if args.seed is not None:
@@ -1164,7 +1173,7 @@ def main():
     log("Loading model...")
     from transformers import AutoModelForCausalLM, AutoTokenizer
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, device_map='cuda')
+        args.model, torch_dtype=torch.bfloat16, device_map='cuda', trust_remote_code=True)
     for p in model.parameters():
         p.requires_grad = True
     log(f"Loaded: {sum(p.numel() for p in model.parameters())/1e9:.2f}B params")
@@ -1195,10 +1204,13 @@ def main():
     else:
         # Load tokenizer and task dataset
         log(f"Loading tokenizer and {args.task} dataset...")
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         tokenizer.padding_side = 'left'  # Required for decoder-only models
+
+        # Model-specific pad token handling
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
 
         from tasks.tasks_llm import get_task_dataset
         dataset = get_task_dataset(
@@ -1211,8 +1223,9 @@ def main():
 
         import torch.nn.functional as F
 
-        # Check if this is a generative task (like SQuAD)
+        # Check task type
         is_generative = dataset.task_type == "generative"
+        is_toolbench = dataset.task_type == "toolbench"
 
         if is_generative:
             # Generative task (SQuAD) - use language modeling loss
@@ -1348,8 +1361,8 @@ def main():
 
             quick_train_acc = None  # No quick accuracy for generative tasks
 
-        else:
-            # Classification task
+        elif is_toolbench or not is_generative:
+            # Classification task (including toolbench which uses numbered labels)
             def get_batch(split='train', indices=None):
                 """Get a batch from the dataset. If indices provided, use those; else sample randomly."""
                 if split == 'train':
@@ -1834,7 +1847,7 @@ def main():
                     'test_acc': last_test_acc,
                     'args': vars(args),
                 }
-                ckpt_path = f'checkpoints/best_{args.task}_np{args.n_perts}_bs{args.batch_size}.pt'
+                ckpt_path = f'checkpoints/best_{args.task}_{run_id}.pt'
                 torch.save(ckpt, ckpt_path)
                 log(f"  >>> NEW BEST TEST! Checkpoint saved: {ckpt_path}")
 
@@ -1852,12 +1865,15 @@ def main():
                 'model_state_dict': {k: v.cpu().clone() for k, v in model.state_dict().items()},
                 'losses': losses,
                 'best': best,
-                'lr': trainer.lr,
-                'epsilon': trainer.epsilon,
+                'lr': trainer.lr if hasattr(trainer, 'lr') else lr,
+                'epsilon': trainer.epsilon if hasattr(trainer, 'epsilon') else epsilon,
             }
-            ckpt_path = f'checkpoints/ckpt_{args.task}_{i+1}.pt'
-            torch.save(ckpt, ckpt_path)
-            log(f"  >>> Checkpoint saved: {ckpt_path}")
+            ckpt_path = f'checkpoints/ckpt_{args.task}_{run_id}_{i+1}.pt'
+            try:
+                torch.save(ckpt, ckpt_path)
+                log(f"  >>> Checkpoint saved: {ckpt_path}")
+            except Exception as e:
+                log(f"  >>> Checkpoint save failed (continuing): {e}")
 
     log(f"DONE: {initial_loss:.4f} -> {losses[-1]:.4f} ({initial_loss/losses[-1]:.2f}x)")
     if args.search_strategy != 'none':

@@ -80,8 +80,9 @@ TASK_CONFIG = {
         "text_columns": ["sentence1", "sentence2", "word"],
         "label_column": "label",
         "num_labels": 2,
-        "label_names": ["no", "yes"],
-        "prompt_template": "Sentence 1: {sentence1}\nSentence 2: {sentence2}\nQuestion: Does the word \"{word}\" have the same meaning in both sentences? Answer:",
+        # MeZO format: capitalized labels, question-first prompt with explicit options
+        "label_names": ["No", "Yes"],
+        "prompt_template": "Does the word \"{word}\" have the same meaning in these two sentences? Yes, No?\n{sentence1}\n{sentence2}\n",
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
@@ -100,6 +101,19 @@ TASK_CONFIG = {
         "val_size": 500,
         "test_size": 1000,
         "task_type": "generative",
+    },
+    "toolbench": {
+        "dataset_name": "tuandunghcmut/toolbench-v1",
+        "dataset_config": "benchmark",
+        "text_columns": ["query", "api_list"],
+        "label_column": "label",  # Processed label (API index 0-9)
+        "num_labels": 10,  # Max 10 API choices
+        "label_names": None,  # Set dynamically (numbers 1-10)
+        "prompt_template": "Query: {query}\n\nAvailable APIs:\n{api_options}\n\nWhich API number should be called? Answer:",
+        "train_size": 500,
+        "val_size": 100,
+        "test_size": 200,
+        "task_type": "toolbench",  # Special task type for API classification
     },
 }
 
@@ -138,9 +152,13 @@ class LLMTaskDataset:
         # Load and prepare datasets
         self._load_datasets()
 
-        # Get label token ids for classification (skip for generative tasks)
+        # Get label token ids for classification (skip for generative/toolbench tasks)
         if self.task_type == "classification":
             self._setup_label_tokens()
+        elif self.task_type == "toolbench":
+            # For toolbench, we use numbered labels (1, 2, 3, etc.)
+            # Setup token IDs for numbers 1-10 (max API choices)
+            self._setup_toolbench_label_tokens()
         else:
             self.label_token_ids = None
 
@@ -148,6 +166,11 @@ class LLMTaskDataset:
         """Load and split the dataset according to MeZO paper splits."""
         dataset_name = self.config["dataset_name"]
         dataset_config = self.config["dataset_config"]
+
+        # Special handling for toolbench (has different split structure)
+        if self.task_name == "toolbench":
+            self._load_toolbench_dataset()
+            return
 
         # Load from HuggingFace datasets
         if dataset_config is not None:
@@ -239,6 +262,127 @@ class LLMTaskDataset:
 
         print(f"[{self.task_name}] Label tokens: {list(zip(self.label_names, self.label_token_ids))}")
 
+    def _setup_toolbench_label_tokens(self):
+        """Setup label token IDs for toolbench (numbered choices 1-10).
+
+        Handles different tokenizers:
+        - OPT: " 1" -> single token [112]
+        - Qwen3: " 1" -> two tokens [220, 16] where 220 is space, 16 is the number
+        """
+        self.label_token_ids = []
+        self.label_names = []
+        # Setup tokens for numbers 1-10 (API choice indices)
+        for i in range(1, 11):
+            label_str = str(i)
+            self.label_names.append(label_str)
+
+            # First try encoding without space prefix (works better for some tokenizers)
+            tokens_no_space = self.tokenizer.encode(label_str, add_special_tokens=False)
+            # Try encoding with space prefix
+            tokens_with_space = self.tokenizer.encode(" " + label_str, add_special_tokens=False)
+
+            if len(tokens_no_space) == 1:
+                # Single token without space - use it directly
+                self.label_token_ids.append(tokens_no_space[0])
+            elif len(tokens_with_space) == 1:
+                # Single token with space (OPT-style) - use it
+                self.label_token_ids.append(tokens_with_space[0])
+            elif len(tokens_with_space) >= 2:
+                # Multi-token (Qwen3-style): [space_token, number_token] - use the last token
+                self.label_token_ids.append(tokens_with_space[-1])
+            elif len(tokens_no_space) > 0:
+                # Fallback to first token without space
+                self.label_token_ids.append(tokens_no_space[0])
+            else:
+                self.label_token_ids.append(0)
+
+        print(f"[{self.task_name}] Label tokens (1-10): {list(zip(self.label_names[:5], self.label_token_ids[:5]))}...")
+
+    def _load_toolbench_dataset(self):
+        """Load and process the ToolBench benchmark dataset."""
+        import json
+
+        dataset_name = self.config["dataset_name"]
+        dataset_config = self.config["dataset_config"]
+
+        # ToolBench has splits: g1_instruction, g1_category, g1_tool, g2_instruction, g2_category, g3_instruction
+        # We'll use g1_instruction for training and g2_instruction for val/test
+        train_split = load_dataset(dataset_name, dataset_config, split="g1_instruction", cache_dir=self.cache_dir)
+        val_test_split = load_dataset(dataset_name, dataset_config, split="g2_instruction", cache_dir=self.cache_dir)
+
+        # Process examples - parse JSON fields and extract labels
+        def process_example(ex):
+            """Process a single toolbench example."""
+            try:
+                api_list = json.loads(ex["api_list"]) if isinstance(ex["api_list"], str) else ex["api_list"]
+                relevant_apis = json.loads(ex["relevant_apis"]) if isinstance(ex["relevant_apis"], str) else ex["relevant_apis"]
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+            if not api_list or not relevant_apis:
+                return None
+
+            # Format API options as numbered list
+            api_options = []
+            api_lookup = {}  # Map (tool_name, api_name) -> index
+            for idx, api in enumerate(api_list):
+                tool_name = api.get("tool_name", "Unknown")
+                api_name = api.get("api_name", "Unknown")
+                api_desc = api.get("api_description", "")[:100]  # Truncate long descriptions
+                api_options.append(f"{idx + 1}. {tool_name}/{api_name}: {api_desc}")
+                api_lookup[(tool_name, api_name)] = idx
+
+            # Find the correct label (index of first relevant API)
+            label = None
+            for rel_api in relevant_apis:
+                if isinstance(rel_api, list) and len(rel_api) >= 2:
+                    key = (rel_api[0], rel_api[1])
+                    if key in api_lookup:
+                        label = api_lookup[key]
+                        break
+
+            if label is None:
+                return None  # Skip examples where we can't find the relevant API
+
+            return {
+                "query": ex["query"],
+                "api_options": "\n".join(api_options),
+                "label": label,
+                "num_apis": len(api_list),
+            }
+
+        # Process all examples
+        train_processed = []
+        for ex in train_split:
+            processed = process_example(ex)
+            if processed:
+                train_processed.append(processed)
+
+        val_test_processed = []
+        for ex in val_test_split:
+            processed = process_example(ex)
+            if processed:
+                val_test_processed.append(processed)
+
+        # Shuffle and split
+        random.seed(self.seed)
+        random.shuffle(train_processed)
+        random.shuffle(val_test_processed)
+
+        # Split val_test into val and test
+        mid = len(val_test_processed) // 2
+
+        train_size = min(self.config["train_size"], len(train_processed))
+        val_size = min(self.config["val_size"], mid)
+        test_size = min(self.config["test_size"], len(val_test_processed) - mid)
+
+        self.train_data = train_processed[:train_size]
+        self.val_data = val_test_processed[:val_size]
+        self.test_data = val_test_processed[mid:mid + test_size]
+
+        print(f"[{self.task_name}] Loaded: train={len(self.train_data)}, "
+              f"val={len(self.val_data)}, test={len(self.test_data)}")
+
     def format_example(self, example: Dict) -> str:
         """Format a single example using the task template."""
         template = self.config["prompt_template"]
@@ -251,6 +395,10 @@ class LLMTaskDataset:
                 format_dict[col] = example[col]
             else:
                 format_dict[col] = ""
+
+        # For toolbench, api_options is pre-processed during loading
+        if self.task_type == "toolbench" and "api_options" in example:
+            format_dict["api_options"] = example["api_options"]
 
         return template.format(**format_dict)
 
