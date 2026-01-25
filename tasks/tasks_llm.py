@@ -97,10 +97,13 @@ TASK_CONFIG = {
         "label_names": None,  # Generative task
         # MeZO-style prompt format
         "prompt_template": "Title: {title}\nContext: {context}\nQuestion: {question}\nAnswer:",
+        # MeZO split: sample 1500 from train, split into train(1000)+dev(500)
+        # Then sample test(1000) from validation split
         "train_size": 1000,
         "val_size": 500,
         "test_size": 1000,
         "task_type": "generative",
+        "mezo_split": True,  # Use MeZO-style split from train only
     },
     "toolbench": {
         "dataset_name": "tuandunghcmut/toolbench-v1",
@@ -191,6 +194,46 @@ class LLMTaskDataset:
         val_data = dataset.get("validation", None)
         test_data = dataset.get("test", None)
 
+        # Shuffle with seed
+        random.seed(self.seed)
+
+        # Check for MeZO-style split (used by SQuAD)
+        # MeZO samples 1500 from train, splits into train(1000)+dev(500)
+        # Then samples test(1000) from validation split
+        if self.config.get("mezo_split", False):
+            train_size = self.config["train_size"]
+            val_size = self.config["val_size"]
+            test_size = self.config["test_size"]
+
+            # Sample train+dev from train split (1500 total -> 1000 train + 500 dev)
+            combined_size = train_size + val_size
+            if train_data and len(train_data) >= combined_size:
+                train_indices = list(range(len(train_data)))
+                random.shuffle(train_indices)
+                combined_indices = train_indices[:combined_size]
+
+                # Split into train and dev
+                self.train_data = [train_data[i] for i in combined_indices[:train_size]]
+                self.val_data = [train_data[i] for i in combined_indices[train_size:combined_size]]
+            else:
+                # Fallback if not enough data
+                print(f"[{self.task_name}] Warning: not enough train data for MeZO split")
+                self.train_data = list(train_data)[:train_size] if train_data else []
+                self.val_data = []
+
+            # Sample test from validation split
+            if val_data:
+                val_indices = list(range(len(val_data)))
+                random.shuffle(val_indices)
+                self.test_data = [val_data[i] for i in val_indices[:test_size]]
+            else:
+                self.test_data = []
+
+            print(f"[{self.task_name}] MeZO split: train={len(self.train_data)}, "
+                  f"val={len(self.val_data)}, test={len(self.test_data)}")
+            return
+
+        # Standard split handling (non-MeZO)
         # Check if test labels are hidden (-1) - common in GLUE for leaderboard
         use_val_as_test = False
         if test_data is None or len(test_data) == 0:
@@ -213,9 +256,6 @@ class LLMTaskDataset:
             test_data = val_list[mid:]
             val_data = val_list[:mid]
             print(f"[{self.task_name}] Split validation into val={len(val_data)}, test={len(test_data)}")
-
-        # Shuffle with seed
-        random.seed(self.seed)
 
         # Sample according to MeZO paper sizes
         train_size = min(self.config["train_size"], len(train_data) if train_data else 0)
@@ -248,19 +288,32 @@ class LLMTaskDataset:
               f"val={len(self.val_data)}, test={len(self.test_data)}")
 
     def _setup_label_tokens(self):
-        """Setup label token IDs for classification."""
-        self.label_token_ids = []
+        """Setup label token IDs for classification.
+
+        For MeZO-style scoring, we store full token sequences for each label
+        to enable length-normalized log probability scoring.
+        """
+        self.label_token_ids = []  # First token of each label (backward compat)
+        self.label_token_seqs = []  # Full token sequences for each label
+
         for label_name in self.label_names:
-            # Get the first token of the label (with space prefix for OPT)
+            # Get the full token sequence (with space prefix for OPT)
             tokens = self.tokenizer.encode(" " + label_name, add_special_tokens=False)
-            if len(tokens) > 0:
-                self.label_token_ids.append(tokens[0])
-            else:
+            if len(tokens) == 0:
                 # Fallback: use label name without space
                 tokens = self.tokenizer.encode(label_name, add_special_tokens=False)
-                self.label_token_ids.append(tokens[0] if tokens else 0)
+
+            # Store first token for backward compatibility
+            self.label_token_ids.append(tokens[0] if tokens else 0)
+            # Store full sequence for MeZO-style scoring
+            self.label_token_seqs.append(tokens if tokens else [0])
+
+        # Check if any label has multiple tokens (affects scoring method)
+        self.has_multi_token_labels = any(len(seq) > 1 for seq in self.label_token_seqs)
 
         print(f"[{self.task_name}] Label tokens: {list(zip(self.label_names, self.label_token_ids))}")
+        if self.has_multi_token_labels:
+            print(f"[{self.task_name}] Multi-token labels detected, using sequence scoring")
 
     def _setup_toolbench_label_tokens(self):
         """Setup label token IDs for toolbench (numbered choices 1-10).
@@ -402,13 +455,25 @@ class LLMTaskDataset:
 
         return template.format(**format_dict)
 
-    def get_answer(self, example: Dict) -> str:
-        """Get the answer for an example (for generative tasks like SQuAD)."""
+    def get_answer(self, example: Dict, return_all: bool = False):
+        """Get the answer for an example (for generative tasks like SQuAD).
+
+        Args:
+            example: The data example
+            return_all: If True, return all gold answers (for evaluation).
+                       If False, return first answer (for training).
+
+        Returns:
+            For generative tasks with return_all=True: List[str] of all gold answers
+            Otherwise: str of the answer
+        """
         if self.task_type == "generative" and self.task_name == "squad":
             answers = example.get("answers", {})
             answer_texts = answers.get("text", [])
+            if return_all:
+                return answer_texts if answer_texts else [""]
             if answer_texts:
-                return answer_texts[0]  # Return first answer
+                return answer_texts[0]  # Return first answer for training
             return ""
         else:
             # For classification, return the label name
@@ -651,16 +716,26 @@ def normalize_answer(s: str) -> str:
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 
-def compute_squad_f1(prediction: str, ground_truth: str) -> float:
-    """Compute F1 score for a single SQuAD prediction."""
+def compute_squad_f1_single(prediction: str, ground_truth: str) -> float:
+    """Compute F1 score for a single SQuAD prediction against one gold answer.
+
+    Uses proper token-count F1 (multiset overlap) as per official SQuAD evaluation.
+    """
+    from collections import Counter
+
     pred_tokens = normalize_answer(prediction).split()
     truth_tokens = normalize_answer(ground_truth).split()
 
     if len(pred_tokens) == 0 or len(truth_tokens) == 0:
-        return int(pred_tokens == truth_tokens)
+        return float(pred_tokens == truth_tokens)
 
-    common = set(pred_tokens) & set(truth_tokens)
-    num_same = len(common)
+    # Use Counter for multiset overlap (official SQuAD metric)
+    pred_counter = Counter(pred_tokens)
+    truth_counter = Counter(truth_tokens)
+
+    # Count common tokens (minimum of counts for each token)
+    common = pred_counter & truth_counter
+    num_same = sum(common.values())
 
     if num_same == 0:
         return 0.0
@@ -671,9 +746,43 @@ def compute_squad_f1(prediction: str, ground_truth: str) -> float:
     return f1
 
 
-def compute_squad_exact_match(prediction: str, ground_truth: str) -> float:
+def compute_squad_f1(prediction: str, ground_truths) -> float:
+    """Compute F1 score for a SQuAD prediction against all gold answers.
+
+    Takes max F1 over all gold answers as per official SQuAD evaluation.
+
+    Args:
+        prediction: Model's predicted answer string
+        ground_truths: Either a single string or list of gold answer strings
+
+    Returns:
+        Maximum F1 score across all gold answers
+    """
+    if isinstance(ground_truths, str):
+        ground_truths = [ground_truths]
+
+    return max(compute_squad_f1_single(prediction, gt) for gt in ground_truths)
+
+
+def compute_squad_exact_match_single(prediction: str, ground_truth: str) -> float:
     """Compute exact match score for a single SQuAD prediction."""
     return float(normalize_answer(prediction) == normalize_answer(ground_truth))
+
+
+def compute_squad_exact_match(prediction: str, ground_truths) -> float:
+    """Compute exact match score against all gold answers (max over all).
+
+    Args:
+        prediction: Model's predicted answer string
+        ground_truths: Either a single string or list of gold answer strings
+
+    Returns:
+        1.0 if any gold answer matches exactly, 0.0 otherwise
+    """
+    if isinstance(ground_truths, str):
+        ground_truths = [ground_truths]
+
+    return max(compute_squad_exact_match_single(prediction, gt) for gt in ground_truths)
 
 
 def compute_generative_loss(

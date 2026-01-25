@@ -1183,9 +1183,15 @@ def main():
         p.requires_grad = True
     log(f"Loaded: {sum(p.numel() for p in model.parameters())/1e9:.2f}B params")
 
-    # CRITICAL: Set to eval mode to disable dropout
-    # Dropout causes different outputs each forward pass, breaking SPSA gradient estimation
-    model.eval()
+    # Set model mode based on solver type
+    # SPSA/MeZO/Random: eval mode to disable dropout (dropout breaks gradient estimation)
+    # Backprop: train mode for proper dropout during fine-tuning
+    if args.solver == 'backprop':
+        model.train()
+        log("Model set to train mode (dropout enabled for backprop)")
+    else:
+        model.eval()
+        log("Model set to eval mode (dropout disabled for gradient estimation)")
 
     # Task-specific setup
     dataset = None
@@ -1399,6 +1405,10 @@ def main():
             probe_batch = list(get_batch('train', indices=_probe_indices[:args.batch_size]))  # [input_ids, attention_mask, labels]
             label_token_ids_tensor = torch.tensor(dataset.label_token_ids, device='cuda')
 
+            # Check for multi-token labels (MeZO-style scoring)
+            has_multi_token_labels = getattr(dataset, 'has_multi_token_labels', False)
+            label_token_seqs = getattr(dataset, 'label_token_seqs', None)
+
             def _resample_probe_batch(seed):
                 """Resample the probe batch with a given seed for reproducible variation."""
                 torch.manual_seed(seed)
@@ -1406,16 +1416,46 @@ def main():
             resample_probe_batch = _resample_probe_batch  # Assign to outer scope variable
 
             def compute_loss_and_acc(input_ids, attention_mask, labels, return_tensor=False):
-                """Compute classification loss and accuracy for a batch."""
+                """Compute classification loss and accuracy for a batch.
+
+                For single-token labels: uses final position logits
+                For multi-token labels: uses mean log probability over label tokens (MeZO-style)
+                """
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                 batch_size = input_ids.size(0)
                 # With left padding, the last position is always the last real token
-                # (NOT attention_mask.sum()-1, which gives wrong index for left padding)
                 seq_lengths = input_ids.size(1) - 1
-                final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
-                label_logits = final_logits[:, label_token_ids_tensor].float()
-                loss = F.cross_entropy(label_logits, labels)
-                preds = label_logits.argmax(dim=1)
+
+                if has_multi_token_labels and label_token_seqs is not None:
+                    # MeZO-style scoring: mean log probability over label sequence
+                    # For each example, compute log p(label | context) for each label
+                    logits = outputs.logits  # [batch, seq_len, vocab]
+                    log_probs = F.log_softmax(logits.float(), dim=-1)
+
+                    num_labels = len(label_token_seqs)
+                    label_scores = torch.zeros(batch_size, num_labels, device='cuda')
+
+                    for label_idx, token_seq in enumerate(label_token_seqs):
+                        # Compute mean log prob for this label sequence
+                        # Token seq is generated after the final position
+                        for pos_offset, token_id in enumerate(token_seq):
+                            # Position in sequence where this token would be predicted
+                            pos = seq_lengths + pos_offset
+                            if pos < logits.size(1):
+                                label_scores[:, label_idx] += log_probs[:, pos, token_id]
+                        # Normalize by sequence length
+                        label_scores[:, label_idx] /= len(token_seq)
+
+                    # Use negative log prob as loss (cross entropy style)
+                    loss = F.cross_entropy(label_scores, labels)
+                    preds = label_scores.argmax(dim=1)
+                else:
+                    # Single-token labels: simple logit extraction
+                    final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
+                    label_logits = final_logits[:, label_token_ids_tensor].float()
+                    loss = F.cross_entropy(label_logits, labels)
+                    preds = label_logits.argmax(dim=1)
+
                 acc = (preds == labels).float().mean().item()
                 if return_tensor:
                     return loss, acc
@@ -1471,11 +1511,14 @@ def main():
             quick_train_acc = _quick_train_acc  # Assign to outer variable
 
         if is_generative:
-            # Generative evaluation (SQuAD) - use F1 score
-            from tasks.tasks_llm import compute_squad_f1, normalize_answer
+            # Generative evaluation (SQuAD) - use F1 score with all gold answers
+            from tasks.tasks_llm import compute_squad_f1, compute_squad_exact_match, normalize_answer
 
             def evaluate_fn(split='val'):
-                """Evaluate F1 score on a dataset split for generative task."""
+                """Evaluate F1 score on a dataset split for generative task.
+
+                Uses official SQuAD evaluation: max F1 over all gold answers.
+                """
                 # Clear cache before eval - generate() uses KV cache which needs extra memory
                 torch.cuda.empty_cache()
 
@@ -1485,6 +1528,7 @@ def main():
                     data = dataset.test_data
 
                 total_f1 = 0.0
+                total_em = 0.0
                 total_samples = 0
 
                 # Use smaller batch for generation (KV cache uses more memory than forward pass)
@@ -1496,7 +1540,8 @@ def main():
                         batch_data = data[start_idx:end_idx]
 
                         texts = [dataset.format_example(ex) for ex in batch_data]
-                        gold_answers = [dataset.get_answer(ex) for ex in batch_data]
+                        # Get ALL gold answers for each example (for official SQuAD metric)
+                        gold_answers_list = [dataset.get_answer(ex, return_all=True) for ex in batch_data]
 
                         encodings = tokenizer(
                             texts, padding="max_length", truncation=True,
@@ -1518,16 +1563,18 @@ def main():
                         )
 
                         # Decode predictions (only new tokens)
-                        for i, (output, gold) in enumerate(zip(outputs, gold_answers)):
+                        for i, (output, gold_answers) in enumerate(zip(outputs, gold_answers_list)):
                             prompt_len = input_ids[i].shape[0]
                             pred_tokens = output[prompt_len:]
                             pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
                             # Take only first line in case newline stopping didn't work
                             pred_text = pred_text.split('\n')[0].strip()
 
-                            # Compute F1
-                            f1 = compute_squad_f1(pred_text, gold)
+                            # Compute F1 and EM using max over all gold answers
+                            f1 = compute_squad_f1(pred_text, gold_answers)
+                            em = compute_squad_exact_match(pred_text, gold_answers)
                             total_f1 += f1
+                            total_em += em
                             total_samples += 1
 
                 # Clear cache after eval to free KV cache memory before returning to training
@@ -1536,7 +1583,11 @@ def main():
         else:
             # Classification evaluation
             def evaluate_fn(split='val'):
-                """Evaluate accuracy on a dataset split."""
+                """Evaluate accuracy on a dataset split.
+
+                For single-token labels: uses final position logits
+                For multi-token labels: uses mean log probability over label tokens (MeZO-style)
+                """
                 # Clear cache before eval
                 torch.cuda.empty_cache()
 
@@ -1547,6 +1598,10 @@ def main():
 
                 total_correct = 0
                 total_samples = 0
+
+                # Check for multi-token labels
+                _has_multi_token = getattr(dataset, 'has_multi_token_labels', False)
+                _label_seqs = getattr(dataset, 'label_token_seqs', None)
 
                 with torch.no_grad():
                     for start_idx in range(0, len(data), args.batch_size):
@@ -1568,11 +1623,29 @@ def main():
                         batch_size = input_ids.size(0)
                         # With left padding, the last position is always the last real token
                         seq_lengths = input_ids.size(1) - 1
-                        final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
 
-                        label_token_ids = torch.tensor(dataset.label_token_ids, device='cuda')
-                        label_logits = final_logits[:, label_token_ids]
-                        predictions = label_logits.argmax(dim=-1)
+                        if _has_multi_token and _label_seqs is not None:
+                            # MeZO-style: mean log probability over label sequence
+                            logits = outputs.logits
+                            log_probs = F.log_softmax(logits.float(), dim=-1)
+
+                            num_labels = len(_label_seqs)
+                            label_scores = torch.zeros(batch_size, num_labels, device='cuda')
+
+                            for label_idx, token_seq in enumerate(_label_seqs):
+                                for pos_offset, token_id in enumerate(token_seq):
+                                    pos = seq_lengths + pos_offset
+                                    if pos < logits.size(1):
+                                        label_scores[:, label_idx] += log_probs[:, pos, token_id]
+                                label_scores[:, label_idx] /= len(token_seq)
+
+                            predictions = label_scores.argmax(dim=-1)
+                        else:
+                            # Single-token labels
+                            final_logits = outputs.logits[torch.arange(batch_size, device='cuda'), seq_lengths]
+                            label_token_ids = torch.tensor(dataset.label_token_ids, device='cuda')
+                            label_logits = final_logits[:, label_token_ids]
+                            predictions = label_logits.argmax(dim=-1)
 
                         total_correct += (predictions == labels_tensor).sum().item()
                         total_samples += len(batch_data)
