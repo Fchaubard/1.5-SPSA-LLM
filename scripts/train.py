@@ -1926,8 +1926,11 @@ def main():
                     'args': vars(args),
                 }
                 ckpt_path = f'checkpoints/best_{args.task}_{run_id}.pt'
-                torch.save(ckpt, ckpt_path)
-                log(f"  >>> NEW BEST TEST! Checkpoint saved: {ckpt_path}")
+                try:
+                    torch.save(ckpt, ckpt_path)
+                    log(f"  >>> NEW BEST TEST! Checkpoint saved: {ckpt_path}")
+                except Exception as e:
+                    log(f"  >>> NEW BEST TEST! (checkpoint save failed: {e})")
 
                 # W&B best metrics
                 if wandb_run is not None:
